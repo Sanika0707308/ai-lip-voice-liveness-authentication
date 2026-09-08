@@ -894,6 +894,7 @@ function CameraPreview() {
         totalEvaluations: 1,
         duration: (response.audioDurationMs || 0) / 1000,
         phraseVerificationStatus: verifStatus,
+        verificationReason: whisper.verificationReason || 'Speech verification failed.',
         overallScore: phraseSim,
         characterSimilarity: charSim,
         wordSimilarity: wordSim,
@@ -1904,12 +1905,12 @@ function CameraPreview() {
             
             <div className="summary-stats-grid">
               <div className="summary-stat-item">
-                <span className="summary-stat-label">Face-tracking Frames</span>
-                <span className="summary-stat-value">{finalSummary.faceFrames ?? 0}</span>
+                <span className="summary-stat-label">Valid Sync Frames</span>
+                <span className="summary-stat-value">{finalSummary.backendSyncResult?.validFrames ?? 0}</span>
               </div>
               <div className="summary-stat-item">
-                <span className="summary-stat-label">Active Microphone Frames</span>
-                <span className="summary-stat-value">{finalSummary.activeAudioFrames ?? 0}</span>
+                <span className="summary-stat-label">Ignored Sync Frames</span>
+                <span className="summary-stat-value">{finalSummary.backendSyncResult?.ignoredFrames ?? 0}</span>
               </div>
               <div className="summary-stat-item">
                 <span className="summary-stat-label">Lip Movement Variation</span>
@@ -1918,7 +1919,7 @@ function CameraPreview() {
               <div className="summary-stat-item" style={{ gridColumn: 'span 2' }}>
                 <span className="summary-stat-label">Verification Basis</span>
                 <span className="summary-stat-value phrase-text-summary">
-                  {finalSummary.reason || (finalResult === 'LIVE'
+                  {finalSummary.verificationReason || finalSummary.reason || (finalResult === 'LIVE'
                     ? 'Lip-voice synchronization and speech verification passed.'
                     : 'Lip-voice synchronization or speech verification failed.')}
                 </span>

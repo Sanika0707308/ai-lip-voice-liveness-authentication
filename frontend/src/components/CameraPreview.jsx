@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { generateSessionId, getRandomChallengePhrase } from '../utils/challengePhrases';
+import { generateSessionId } from '../utils/challengePhrases';
 import { fetchNewChallengePhrase, uploadAudioForSync } from '../utils/api';
 
 // Day 16 additions: Configurable constants for Lip-Voice Synchronization Engine
@@ -14,7 +14,7 @@ const SPOOF_CONFIRMATION_FRAMES = 3;
 
 // Day 17 additions: Configurable constants for Challenge Phrase Library
 const RECENT_CHALLENGE_HISTORY_SIZE = 5;
-const RECORDING_DURATION_MS = 5000; // Auto-stop recording after 5 seconds
+const MAX_RECORDING_DURATION_MS = 60000; // Safety stop if the user forgets to stop
 const MIN_LOCAL_AUDIO_ENERGY = 0.08;
 const MIN_LOCAL_FACE_FRAMES = 20;
 const MIN_LOCAL_AUDIO_FRAMES = 30;
@@ -383,13 +383,6 @@ function CameraPreview() {
     }
   }, [status, micStatus, challengePhrase, challengeStatus]);
 
-  // Automate recording start once phrase is READY
-  useEffect(() => {
-    if (challengeStatus === 'READY' && status === 'active' && micStatus === 'active' && !isRecording && isVerifying) {
-      startRecording();
-    }
-  }, [challengeStatus, status, micStatus, isRecording, isVerifying]);
-
   // Day 17: Sync challengeStatus with isRecording state and manage expiry timer
   useEffect(() => {
     if (isRecording) {
@@ -685,13 +678,13 @@ function CameraPreview() {
       startLocalSpeechRecognition();
       console.log("MediaRecorder started");
 
-      // Auto-stop recording after RECORDING_DURATION_MS
+      // Keep a safety cap, but let the user choose when to finish speaking.
       if (recordingDurationTimeoutRef.current) {
         clearTimeout(recordingDurationTimeoutRef.current);
       }
       recordingDurationTimeoutRef.current = setTimeout(() => {
         stopRecording();
-      }, RECORDING_DURATION_MS);
+      }, MAX_RECORDING_DURATION_MS);
 
     } catch (err) {
       console.error("Failed to start MediaRecorder:", err);
@@ -2119,19 +2112,22 @@ function CameraPreview() {
             ) : (
               <div className="completed-indicator">
                 <span className="completed-icon">✅</span>
-                <span>Recording captured locally. Synchronization is the next project phase.</span>
+                <span>Recording captured. Sending it for speech and lip-voice verification.</span>
               </div>
             )}
           </div>
 
           <div className="challenge-controls">
             {challengeStatus === 'RECORDING' ? (
-              <button 
-                className="btn-stop-record" 
-                onClick={stopRecording}
-              >
-                🔴 Stop Recording
-              </button>
+              <>
+                <div className="recording-duration">Recording time: {recordingTime}s</div>
+                <button
+                  className="btn-stop-record"
+                  onClick={stopRecording}
+                >
+                  Stop Recording &amp; Verify
+                </button>
+              </>
             ) : (
               <button 
                 className="btn-start-record" 
@@ -2139,7 +2135,7 @@ function CameraPreview() {
                 title={phraseVerificationStatus ? "Verification completed" : !faceDetected ? "Position face in camera to record" : "Start Recording"}
                 onClick={startRecording}
               >
-                🎙️ Start Recording
+                Start Recording
               </button>
             )}
           </div>

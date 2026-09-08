@@ -1481,8 +1481,18 @@ body {
 
 .challenge-controls {
   display: flex;
+  flex-direction: column;
+  align-items: stretch;
   justify-content: center;
+  gap: 8px;
   margin-top: 4px;
+}
+
+.recording-duration {
+  color: var(--color-secondary);
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
 }
 
 .btn-start-record {

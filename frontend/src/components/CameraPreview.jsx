@@ -844,8 +844,7 @@ function CameraPreview() {
       
       setBackendSyncResult(response);
       
-      // Update UI metrics with response
-      const isLive = response.syncStatus === 'LIVE';
+      // A live decision requires both temporal synchronization and speech verification.
       setSyncScore(response.alignedCorrelation || 0);
       setRawSyncScore(response.rawCorrelation || 0);
       setSyncStatus(response.syncStatus || 'SPOOF');
@@ -859,6 +858,7 @@ function CameraPreview() {
       const confidence = whisper.whisperConfidence || 0;
       const phraseSim = whisper.overallScore || 0;
       const verifStatus = whisper.verificationStatus || 'FAIL';
+      const isLive = response.syncStatus === 'LIVE' && verifStatus === 'PASS';
       
       setRecognizedText(recognized);
       setCharacterSimilarity(charSim);
@@ -1916,8 +1916,12 @@ function CameraPreview() {
                 <span className="summary-stat-value">{(finalSummary.lipVariation ?? 0).toFixed(3)}</span>
               </div>
               <div className="summary-stat-item" style={{ gridColumn: 'span 2' }}>
-                <span className="summary-stat-label">Local Result Basis</span>
-                <span className="summary-stat-value phrase-text-summary">{finalSummary.reason}</span>
+                <span className="summary-stat-label">Verification Basis</span>
+                <span className="summary-stat-value phrase-text-summary">
+                  {finalSummary.reason || (finalResult === 'LIVE'
+                    ? 'Lip-voice synchronization and speech verification passed.'
+                    : 'Lip-voice synchronization or speech verification failed.')}
+                </span>
               </div>
               <div className="summary-stat-item" style={{ gridColumn: 'span 2' }}>
                 <span className="summary-stat-label">Displayed Challenge</span>

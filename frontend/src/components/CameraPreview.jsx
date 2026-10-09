@@ -1,6 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { generateSessionId } from '../utils/challengePhrases';
-import { fetchNewChallengePhrase, uploadAudioForSync } from '../utils/api';
+import {
+  fetchNewChallengePhrase,
+  uploadAudioForSync,
+  fetchCalibrationStatus,
+  startNewCalibration,
+  uploadCalibrationSample
+} from '../utils/api';
 
 // Day 16 additions: Configurable constants for Lip-Voice Synchronization Engine
 const MIN_SYNC_SAMPLES = 15;
@@ -20,13 +26,88 @@ const MIN_LOCAL_FACE_FRAMES = 20;
 const MIN_LOCAL_AUDIO_FRAMES = 30;
 const MIN_LOCAL_LIP_VARIATION = 0.02;
 
+// Backend synchronization reference thresholds (matching backend/config.py)
+const BACKEND_LIVE_SYNC_THRESHOLD = 0.45;
+const BACKEND_MAX_SYNC_OFFSET_MS = 500;
+const DEFAULT_CALIBRATION_SAMPLES = 3;
 
+// Supported challenge-response languages
+const LANGUAGE_OPTIONS = [
+  { code: 'en', label: 'English', englishName: 'English', speechLang: 'en-US' },
+  { code: 'hi', label: 'हिन्दी', englishName: 'Hindi', speechLang: 'hi-IN' },
+  { code: 'mr', label: 'मराठी', englishName: 'Marathi', speechLang: 'mr-IN' }
+];
 
+const getLanguageMeta = (code) =>
+  LANGUAGE_OPTIONS.find((item) => item.code === code) || LANGUAGE_OPTIONS[0];
 
+/**
+ * Smooths raw lip opening ratios with a 5-point centered moving average and normalizes
+ * both lip and audio signals to [0, 1] for live real-time waveform visualization.
+ */
+const buildLiveNormalizedSeries = (rawPoints, isRecordingWindow = false) => {
+  if (!rawPoints || rawPoints.length === 0) return [];
+  const t0 = isRecordingWindow ? 0 : rawPoints[0].tMs;
+  const n = rawPoints.length;
+  const lipVals = rawPoints.map(p => p.lipRaw);
+  const audioVals = rawPoints.map(p => p.audioRaw);
+
+  // 5-point centered moving average on lip movement signal (matching SyncService.smooth_signal)
+  const smoothedLip = lipVals.map((_, idx) => {
+    const start = Math.max(0, idx - 2);
+    const end = Math.min(n, idx + 3);
+    let sum = 0;
+    for (let j = start; j < end; j++) sum += lipVals[j];
+    return sum / (end - start);
+  });
+
+  const minLip = Math.min(...smoothedLip);
+  const maxLip = Math.max(...smoothedLip);
+  const lipRange = Math.max(maxLip - minLip, 0.04);
+
+  const minAud = Math.min(...audioVals);
+  const maxAud = Math.max(...audioVals);
+  const audRange = Math.max(maxAud - minAud, 0.08);
+
+  return rawPoints.map((pt, idx) => ({
+    tSec: Math.max(0, (pt.tMs - t0) / 1000),
+    lipNorm: Math.min(1, Math.max(0, (smoothedLip[idx] - minLip) / lipRange)),
+    audioNorm: Math.min(1, Math.max(0, (audioVals[idx] - minAud) / audRange))
+  }));
+};
+
+/**
+ * Converts backend signalSeries ({ timestampsMs, normalizedLip, normalizedAudio })
+ * into graph points [{ tSec, lipNorm, audioNorm }].
+ */
+const buildBackendSignalSeries = (signalSeries) => {
+  if (
+    !signalSeries ||
+    !Array.isArray(signalSeries.timestampsMs) ||
+    !Array.isArray(signalSeries.normalizedLip) ||
+    !Array.isArray(signalSeries.normalizedAudio)
+  ) {
+    return [];
+  }
+  const len = Math.min(
+    signalSeries.timestampsMs.length,
+    signalSeries.normalizedLip.length,
+    signalSeries.normalizedAudio.length
+  );
+  const points = [];
+  for (let i = 0; i < len; i++) {
+    points.push({
+      tSec: Math.max(0, Number(signalSeries.timestampsMs[i]) / 1000),
+      lipNorm: Math.min(1, Math.max(0, Number(signalSeries.normalizedLip[i]) || 0)),
+      audioNorm: Math.min(1, Math.max(0, Number(signalSeries.normalizedAudio[i]) || 0))
+    });
+  }
+  return points;
+};
 // Configurable constants for MediaPipe Face Mesh custom adjustments
 const SHOW_LIP_LANDMARKS = true;
-const LIP_OUTER_COLOR = "#FF5500"; // Neon Orange
-const LIP_INNER_COLOR = "#FF0055"; // Neon Pink/Red
+const LIP_OUTER_COLOR = "#0D9488"; // Secondary Accent (Teal)
+const LIP_INNER_COLOR = "#2563EB"; // Primary Brand (Blue)
 const LANDMARK_RADIUS = 2;
 const MAX_NUM_FACES = 1;
 
@@ -463,13 +544,104 @@ function CameraPreview() {
   // Day 18 additions: Challenge Phrase Verification references
   const activeChallengeRef = useRef('');
   const activeSessionIdRef = useRef('');
+  const activeLanguageRef = useRef('en');
   const abortControllerRef = useRef(null);
+
+  // Multilingual Challenge-Response state & ref ('en' | 'hi' | 'mr')
+  const [selectedLanguage, setSelectedLanguage] = useState(() => {
+    try {
+      const savedLang = window.localStorage.getItem('liveness_language');
+      if (savedLang && ['en', 'hi', 'mr'].includes(savedLang)) {
+        return savedLang;
+      }
+      return 'en';
+    } catch {
+      return 'en';
+    }
+  });
+  const selectedLanguageRef = useRef(selectedLanguage);
+  useEffect(() => {
+    selectedLanguageRef.current = selectedLanguage;
+    try {
+      window.localStorage.setItem('liveness_language', selectedLanguage);
+    } catch {
+      // Ignore localStorage write errors
+    }
+  }, [selectedLanguage]);
 
   const isRecordingRef = useRef(false);
   const recordingLipMovementRef = useRef([]);
   const recordingLipTimestampsRef = useRef([]);
   const localEvidenceRef = useRef({ faceFrames: 0, activeAudioFrames: 0 });
   const [backendSyncResult, setBackendSyncResult] = useState(null);
+
+  // Real-time lip & audio signal series refs and state for live graph visualization
+  const latestAudioEnergyRef = useRef(0);
+  const previewSignalSeriesRef = useRef([]);
+  const recordingSignalSeriesRef = useRef([]);
+  const lastGraphUpdateRef = useRef(0);
+  const [liveGraphPoints, setLiveGraphPoints] = useState([]);
+
+  // Per-User Adaptive Synchronization Threshold Calibration state & refs
+  const [userId, setUserId] = useState(() => {
+    try {
+      const saved = window.localStorage.getItem('liveness_user_id');
+      if (saved && saved.trim()) return saved.trim();
+      const generated = 'user-default';
+      window.localStorage.setItem('liveness_user_id', generated);
+      return generated;
+    } catch {
+      return 'user-default';
+    }
+  });
+  const userIdRef = useRef(userId);
+  useEffect(() => {
+    userIdRef.current = userId;
+    try {
+      window.localStorage.setItem('liveness_user_id', userId);
+    } catch {
+      // Ignore localStorage write errors
+    }
+  }, [userId]);
+
+  const [isCalibrationMode, setIsCalibrationMode] = useState(false);
+  const isCalibrationModeRef = useRef(false);
+  useEffect(() => {
+    isCalibrationModeRef.current = isCalibrationMode;
+  }, [isCalibrationMode]);
+
+  const [calibrationProfile, setCalibrationProfile] = useState({
+    userId: 'user-default',
+    calibrationStatus: 'NOT_STARTED',
+    isCalibrated: false,
+    requiredSamples: DEFAULT_CALIBRATION_SAMPLES,
+    validSamplesCount: 0,
+    totalAttempts: 0,
+    validScores: [],
+    meanScore: null,
+    medianScore: null,
+    stdDeviation: null,
+    adaptiveThreshold: null,
+    effectiveThreshold: BACKEND_LIVE_SYNC_THRESHOLD,
+    globalThreshold: BACKEND_LIVE_SYNC_THRESHOLD
+  });
+  const [lastCalibrationOutcome, setLastCalibrationOutcome] = useState(null);
+
+  const refreshCalibrationStatus = async (targetUser = userIdRef.current) => {
+    if (!targetUser) return;
+    try {
+      const data = await fetchCalibrationStatus(targetUser);
+      if (data && data.calibrationProfile) {
+        setCalibrationProfile(data.calibrationProfile);
+      }
+    } catch (err) {
+      console.warn('Could not fetch calibration status:', err);
+    }
+  };
+
+  useEffect(() => {
+    refreshCalibrationStatus(userId);
+  }, [userId]);
 
   // Ref to track status across asynchronous frame loop executions without closure staleness
   const statusRef = useRef(status);
@@ -504,7 +676,7 @@ function CameraPreview() {
     const recognition = new SpeechRecognition();
     recognition.continuous = true;
     recognition.interimResults = false;
-    recognition.lang = 'en-US';
+    recognition.lang = getLanguageMeta(selectedLanguageRef.current).speechLang;
     recognition.onresult = (event) => {
       let transcript = '';
       for (let index = event.resultIndex; index < event.results.length; index += 1) {
@@ -590,19 +762,21 @@ function CameraPreview() {
   };
 
   /**
-   * Day 17: Helper to randomly choose a challenge phrase and configure the authentication session.
+   * Day 17: Helper to randomly choose a challenge phrase in the selected language and configure the authentication session.
    */
-  const generateChallengePhrase = async () => {
+  const generateChallengePhrase = async (overrideLanguage = null) => {
     if (challengeStatus === "RECORDING" || isRecording) {
       console.warn("Cannot generate new challenge phrase during active recording.");
       return;
     }
 
+    const langToUse = overrideLanguage || selectedLanguageRef.current || 'en';
+
     // 1. Ensure unique Session ID exists
     ensureSessionId();
     setChallengeStatus("WAITING");
     try {
-      const serverChallenge = await fetchNewChallengePhrase(challengeSessionIdRef.current);
+      const serverChallenge = await fetchNewChallengePhrase(challengeSessionIdRef.current, langToUse);
       const phrase = serverChallenge.challengePhrase;
       setChallengePhrase(phrase);
       setDisplayedChallenge(phrase);
@@ -621,6 +795,15 @@ function CameraPreview() {
     }
   };
 
+  const handleLanguageChange = async (newLang) => {
+    if (isRecording || phraseVerificationLoading) return;
+    setSelectedLanguage(newLang);
+    selectedLanguageRef.current = newLang;
+    if (status === 'active' && micStatus === 'active') {
+      await generateChallengePhrase(newLang);
+    }
+  };
+
   // Day 18 additions: Recording and Verification logic
   const startRecording = () => {
     if (!audioStreamRef.current) {
@@ -636,13 +819,17 @@ function CameraPreview() {
     
     activeChallengeRef.current = challengePhrase;
     activeSessionIdRef.current = challengeSessionIdRef.current;
+    activeLanguageRef.current = selectedLanguageRef.current || 'en';
     
     resetVerificationStates();
     setBackendSyncResult(null);
     recordingLipMovementRef.current = [];
     recordingLipTimestampsRef.current = [];
+    recordingSignalSeriesRef.current = [];
+    setLiveGraphPoints([]);
     localEvidenceRef.current = { faceFrames: 0, activeAudioFrames: 0 };
     
+    const TARGET_RECORDING_SECONDS = 5;
     const chunks = [];
     try {
       const mediaRecorder = new MediaRecorder(audioStreamRef.current, { mimeType: 'audio/webm' });
@@ -652,6 +839,15 @@ function CameraPreview() {
         if (e.data && e.data.size > 0) {
           chunks.push(e.data);
         }
+      };
+      
+      mediaRecorder.onerror = async (event) => {
+        console.error("MediaRecorder error:", event.error);
+        setVerificationError("Audio recording error occurred.");
+        setVerificationStage('ERROR');
+        isRecordingRef.current = false;
+        setIsRecording(false);
+        await stopStreamsImmediately();
       };
       
       mediaRecorder.onstop = async () => {
@@ -671,32 +867,44 @@ function CameraPreview() {
       recordingStartTimeRef.current = performance.now();
       setRecordingTime(0);
       recordingTimerRef.current = setInterval(() => {
-        setRecordingTime(prev => prev + 1);
+        setRecordingTime(prev => {
+          const nextTime = prev + 1;
+          if (nextTime >= TARGET_RECORDING_SECONDS) {
+            setTimeout(() => stopRecording(), 0);
+          }
+          return nextTime;
+        });
       }, 1000);
       
       mediaRecorder.start();
       startLocalSpeechRecognition();
       console.log("MediaRecorder started");
 
-      // Keep a safety cap, but let the user choose when to finish speaking.
+      // Auto-stop at 5-second target recording duration
       if (recordingDurationTimeoutRef.current) {
         clearTimeout(recordingDurationTimeoutRef.current);
       }
       recordingDurationTimeoutRef.current = setTimeout(() => {
         stopRecording();
-      }, MAX_RECORDING_DURATION_MS);
+      }, TARGET_RECORDING_SECONDS * 1000);
 
     } catch (err) {
       console.error("Failed to start MediaRecorder:", err);
       setVerificationError("Failed to start audio recording: " + err.message);
       setVerificationStage('ERROR');
       isRecordingRef.current = false;
+      setIsRecording(false);
+      stopStreamsImmediately();
     }
   };
 
-  const stopRecording = () => {
+  const stopRecording = async () => {
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      mediaRecorderRef.current.stop();
+      try {
+        mediaRecorderRef.current.stop();
+      } catch (err) {
+        console.warn("Error stopping mediaRecorder:", err);
+      }
       console.log("MediaRecorder stopped");
     }
     stopLocalSpeechRecognition();
@@ -711,12 +919,18 @@ function CameraPreview() {
       clearTimeout(recordingDurationTimeoutRef.current);
       recordingDurationTimeoutRef.current = null;
     }
+
+    // Release camera stream immediately when recording ends
+    await stopStreamsImmediately();
   };
 
   const stopStreamsImmediately = async () => {
-    // 1. Set verification state to false so frame/audio processing loop terminates
+    // 1. Immediately flag processing loops to abort
     setIsVerifying(false);
     isVerifyingRef.current = false;
+    statusRef.current = 'off';
+    micStatusRef.current = 'off';
+    isRecordingRef.current = false;
     stopLocalSpeechRecognition();
 
     // 2. Terminate animation frame loops
@@ -729,25 +943,53 @@ function CameraPreview() {
       audioAnimationFrameIdRef.current = null;
     }
 
-    // 3. Stop all webcam tracks
+    // 3. Stop and disable all webcam tracks
     if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => {
-        track.stop();
-        console.log(`Stopped video track: ${track.label}`);
-      });
+      try {
+        streamRef.current.getTracks().forEach(track => {
+          track.enabled = false;
+          track.stop();
+          console.log(`Stopped video track: ${track.label}`);
+        });
+      } catch (err) {
+        console.warn('Error stopping video stream tracks:', err);
+      }
       streamRef.current = null;
     }
 
-    // 4. Stop all microphone tracks
+    // 4. Stop and disable any tracks attached directly to the HTML video element
+    if (videoRef.current) {
+      try {
+        if (videoRef.current.srcObject) {
+          const vStream = videoRef.current.srcObject;
+          if (typeof vStream.getTracks === 'function') {
+            vStream.getTracks().forEach(track => {
+              track.enabled = false;
+              track.stop();
+            });
+          }
+        }
+      } catch (err) {
+        console.warn('Error clearing videoRef srcObject tracks:', err);
+      }
+      videoRef.current.srcObject = null;
+    }
+
+    // 5. Stop and disable all microphone tracks
     if (audioStreamRef.current) {
-      audioStreamRef.current.getTracks().forEach(track => {
-        track.stop();
-        console.log(`Stopped audio track: ${track.label}`);
-      });
+      try {
+        audioStreamRef.current.getTracks().forEach(track => {
+          track.enabled = false;
+          track.stop();
+          console.log(`Stopped audio track: ${track.label}`);
+        });
+      } catch (err) {
+        console.warn('Error stopping audio tracks:', err);
+      }
       audioStreamRef.current = null;
     }
 
-    // 5. Close AudioContext
+    // 6. Close AudioContext
     if (audioContextRef.current) {
       try {
         if (audioContextRef.current.state !== 'closed') {
@@ -759,22 +1001,21 @@ function CameraPreview() {
       audioContextRef.current = null;
     }
 
-    // 6. Reset audio analyzer and energy
+    // 7. Reset audio analyzer and energy
     audioAnalyserRef.current = null;
+    latestAudioEnergyRef.current = 0;
+    previewSignalSeriesRef.current = [];
     setAudioEnergy(0);
     audioBufferRef.current = [];
     setMicStatus('off');
-
-    // 7. Clear video element source
-    if (videoRef.current) {
-      videoRef.current.srcObject = null;
-    }
 
     // 8. Clear Canvas overlay
     if (canvasRef.current) {
       const canvas = canvasRef.current;
       const ctx = canvas.getContext('2d');
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (ctx) {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+      }
     }
 
     // 9. Close FaceMesh model instance to release resources
@@ -812,12 +1053,50 @@ function CameraPreview() {
     lipRatioBufferRef.current = [];
   };
 
+
+  const handleStartNewCalibration = async () => {
+    try {
+      setLastCalibrationOutcome(null);
+      const res = await startNewCalibration(
+        userIdRef.current,
+        challengeSessionIdRef.current || '',
+        DEFAULT_CALIBRATION_SAMPLES
+      );
+      if (res && res.calibrationProfile) {
+        setCalibrationProfile(res.calibrationProfile);
+      }
+      setIsCalibrationMode(true);
+      isCalibrationModeRef.current = true;
+      if (status !== 'active') {
+        await startCamera();
+      } else {
+        await generateChallengePhrase();
+      }
+    } catch (err) {
+      console.error('Failed to start calibration:', err);
+      setVerificationError(err.message || 'Failed to start calibration.');
+    }
+  };
+
+  const handleContinueCalibration = async () => {
+    setLastCalibrationOutcome(null);
+    setIsCalibrationMode(true);
+    isCalibrationModeRef.current = true;
+    if (status !== 'active') {
+      await startCamera();
+    } else {
+      await generateChallengePhrase();
+    }
+  };
+
   const uploadAudioAndVerify = async (audioBlob) => {
     // Immediately release camera and microphone streams!
     await stopStreamsImmediately();
 
     const boundChallenge = activeChallengeRef.current;
     const boundSessionId = activeSessionIdRef.current;
+    const boundLanguage = activeLanguageRef.current || selectedLanguageRef.current || 'en';
+    const calibrating = isCalibrationModeRef.current;
     
     if (!boundSessionId) {
       console.warn("Missing bound session ID for verification upload");
@@ -829,13 +1108,28 @@ function CameraPreview() {
     setVerificationError('');
     
     try {
-      const response = await uploadAudioForSync(
-        audioBlob,
-        recordingLipMovementRef.current,
-        recordingLipTimestampsRef.current,
-        boundSessionId,
-        abortControllerRef.current ? abortControllerRef.current.signal : null
-      );
+      const response = calibrating
+        ? await uploadCalibrationSample(
+            audioBlob,
+            recordingLipMovementRef.current,
+            recordingLipTimestampsRef.current,
+            boundSessionId,
+            userIdRef.current,
+            boundChallenge,
+            abortControllerRef.current ? abortControllerRef.current.signal : null,
+            calibrationProfile?.requiredSamples || DEFAULT_CALIBRATION_SAMPLES,
+            boundLanguage
+          )
+        : await uploadAudioForSync(
+            audioBlob,
+            recordingLipMovementRef.current,
+            recordingLipTimestampsRef.current,
+            boundSessionId,
+            abortControllerRef.current ? abortControllerRef.current.signal : null,
+            boundChallenge,
+            userIdRef.current,
+            boundLanguage
+          );
       
       if (response.sessionId !== activeSessionIdRef.current) {
         console.warn("Discarding response for stale session ID:", response.sessionId);
@@ -843,22 +1137,41 @@ function CameraPreview() {
       }
       
       setBackendSyncResult(response);
+
+      if (response.calibrationProfile) {
+        setCalibrationProfile(response.calibrationProfile);
+      }
+      if (calibrating) {
+        setLastCalibrationOutcome({
+          sampleAccepted: Boolean(response.sampleAccepted),
+          sampleRejectionReason: response.sampleRejectionReason || null,
+          alignedCorrelation: Number(response.alignedCorrelation || 0),
+          currentSampleNumber: Number(response.currentSampleNumber || 0),
+          requiredSamples: Number(response.requiredSamples || DEFAULT_CALIBRATION_SAMPLES)
+        });
+        if (response.isCalibrated || response.calibrationStatus === 'COMPLETE') {
+          setIsCalibrationMode(false);
+          isCalibrationModeRef.current = false;
+        }
+      }
       
-      // A live decision requires both temporal synchronization and speech verification.
+      const whisper = response.whisperVerification || {};
+      const resolvedLang = response.language || whisper.language || boundLanguage;
+      const recognized = response.transcribedPhrase || whisper.recognizedText || '';
+      const charSim = whisper.characterSimilarityPercentage || 0;
+      const wordSim = whisper.wordMatchPercentage || 0;
+      const confidence = whisper.whisperConfidence || 0;
+      const phraseSim = whisper.overallScore || 0;
+      const verifStatus = whisper.verificationStatus || (response.isChallengeMatch ? 'PASS' : 'FAIL');
+      const isLive = calibrating ? Boolean(response.sampleAccepted) : (response.livenessResult === 'LIVE');
+      const finalRes = isLive ? 'LIVE' : 'SPOOF';
+      const rejectionReason = response.rejectionReason || (!isLive ? (whisper.verificationReason || 'Liveness criteria not satisfied.') : null);
+
       setSyncScore(response.alignedCorrelation || 0);
       setRawSyncScore(response.rawCorrelation || 0);
       setSyncStatus(response.syncStatus || 'SPOOF');
       setSyncConfidence(Math.max(0, Math.min((response.alignedCorrelation || 0) * 100, 100)));
       setSyncSamplesCount(response.validFrames || 0);
-      
-      const whisper = response.whisperVerification || {};
-      const recognized = whisper.recognizedText || '';
-      const charSim = whisper.characterSimilarityPercentage || 0;
-      const wordSim = whisper.wordMatchPercentage || 0;
-      const confidence = whisper.whisperConfidence || 0;
-      const phraseSim = whisper.overallScore || 0;
-      const verifStatus = whisper.verificationStatus || 'FAIL';
-      const isLive = response.syncStatus === 'LIVE' && verifStatus === 'PASS';
       
       setRecognizedText(recognized);
       setCharacterSimilarity(charSim);
@@ -874,6 +1187,7 @@ function CameraPreview() {
       // Save history item
       const newHistoryItem = {
         timestamp: new Date().toLocaleTimeString(),
+        language: resolvedLang,
         overallScore: phraseSim,
         characterSimilarity: charSim,
         wordSimilarity: wordSim,
@@ -884,8 +1198,13 @@ function CameraPreview() {
       };
       setVerificationHistory(prev => [newHistoryItem, ...prev].slice(0, 5));
 
+      const backendGraphPoints = buildBackendSignalSeries(response.signalSeries);
+      const fallbackGraphPoints = buildLiveNormalizedSeries(recordingSignalSeriesRef.current, true);
+      const signalGraphPoints = backendGraphPoints.length > 0 ? backendGraphPoints : fallbackGraphPoints;
+
       // Construct final summary statistics for summary card display
       setFinalSummary({
+        language: resolvedLang,
         averageScore: response.alignedCorrelation || 0,
         maxScore: response.alignedCorrelation || 0,
         minScore: response.alignedCorrelation || 0,
@@ -894,7 +1213,8 @@ function CameraPreview() {
         totalEvaluations: 1,
         duration: (response.audioDurationMs || 0) / 1000,
         phraseVerificationStatus: verifStatus,
-        verificationReason: whisper.verificationReason || 'Speech verification failed.',
+        verificationReason: rejectionReason || (isLive ? 'Lip-voice synchronization and speech verification passed.' : 'Verification failed.'),
+        rejectionReason: rejectionReason,
         overallScore: phraseSim,
         characterSimilarity: charSim,
         wordSimilarity: wordSim,
@@ -902,11 +1222,15 @@ function CameraPreview() {
         processingTime: response.detectedTimeOffsetMs || 0,
         recordingDuration: response.audioDurationMs || 0,
         recognizedText: recognized,
-        expectedPhrase: boundChallenge,
-        backendSyncResult: response
+        transcribedPhrase: recognized,
+        expectedPhrase: response.challengePhrase || boundChallenge,
+        backendSyncResult: response,
+        signalGraphPoints: signalGraphPoints,
+        isBackendSignalSeries: backendGraphPoints.length > 0,
+        wasCalibrationAttempt: calibrating
       });
       
-      setFinalResult(isLive ? 'LIVE' : 'SPOOF');
+      setFinalResult(finalRes);
       setShowSummaryCard(true);
 
       // Immediately release camera and microphone streams!
@@ -923,13 +1247,27 @@ function CameraPreview() {
       
       let errMsg = "Failed to complete synchronization verification.";
       if (err.message) {
-        errMsg = err.message;
+        errMsg = err.message.includes("Insufficient samples")
+          ? `${err.message} Face was not detected for enough frames during recording.`
+          : err.message;
       }
       setVerificationError(errMsg);
       setSyncStatus('SPOOF');
+      if (calibrating) {
+        setLastCalibrationOutcome({
+          sampleAccepted: false,
+          sampleRejectionReason: errMsg,
+          alignedCorrelation: 0,
+          currentSampleNumber: calibrationProfile?.validSamplesCount || 0,
+          requiredSamples: calibrationProfile?.requiredSamples || DEFAULT_CALIBRATION_SAMPLES
+        });
+      }
+
+      const fallbackGraphPoints = buildLiveNormalizedSeries(recordingSignalSeriesRef.current, true);
 
       // Construct final summary for error/spoof case
       setFinalSummary({
+        language: boundLanguage,
         averageScore: 0,
         maxScore: 0,
         minScore: 0,
@@ -938,6 +1276,8 @@ function CameraPreview() {
         totalEvaluations: 1,
         duration: 0,
         phraseVerificationStatus: 'FAIL',
+        verificationReason: errMsg,
+        rejectionReason: errMsg,
         overallScore: 0,
         characterSimilarity: 0,
         wordSimilarity: 0,
@@ -945,8 +1285,12 @@ function CameraPreview() {
         processingTime: 0,
         recordingDuration: 0,
         recognizedText: '',
+        transcribedPhrase: '',
         expectedPhrase: boundChallenge,
-        backendSyncResult: null
+        backendSyncResult: null,
+        signalGraphPoints: fallbackGraphPoints,
+        isBackendSignalSeries: false,
+        wasCalibrationAttempt: calibrating
       });
       setFinalResult('SPOOF');
       setShowSummaryCard(true);
@@ -1188,6 +1532,7 @@ function CameraPreview() {
       setFaceDetected(hasFace);
 
       // 3. Process metrics and update rolling buffer
+      let currentFrameRatio = 0;
       if (hasFace) {
         const landmarks = results.multiFaceLandmarks[0];
         const pUpper = landmarks[UPPER_LIP_CENTER];
@@ -1199,6 +1544,7 @@ function CameraPreview() {
           const vDist = calculateDistance(pUpper, pLower);
           const hDist = calculateDistance(pLeft, pRight);
           const ratio = hDist > 0 ? (vDist / hDist) : 0;
+          currentFrameRatio = ratio;
 
           setMetrics({
             verticalDistance: vDist,
@@ -1235,6 +1581,35 @@ function CameraPreview() {
           lipOpeningRatio: 0
         });
         lipRatioBufferRef.current = [];
+      }
+
+      // Update live time-series signal buffers for real-time lip vs. audio visualization
+      const currentAudioVal = latestAudioEnergyRef.current || 0;
+      if (isRecordingRef.current) {
+        const recElapsedMs = Math.max(0, now - recordingStartTimeRef.current);
+        recordingSignalSeriesRef.current.push({
+          tMs: recElapsedMs,
+          lipRaw: currentFrameRatio,
+          audioRaw: currentAudioVal
+        });
+      } else {
+        previewSignalSeriesRef.current.push({
+          tMs: now,
+          lipRaw: currentFrameRatio,
+          audioRaw: currentAudioVal
+        });
+        previewSignalSeriesRef.current = previewSignalSeriesRef.current.filter(
+          pt => now - pt.tMs <= 5000
+        );
+      }
+
+      if (now - lastGraphUpdateRef.current >= 80) {
+        lastGraphUpdateRef.current = now;
+        if (isRecordingRef.current) {
+          setLiveGraphPoints(buildLiveNormalizedSeries(recordingSignalSeriesRef.current, true));
+        } else {
+          setLiveGraphPoints(buildLiveNormalizedSeries(previewSignalSeriesRef.current, false));
+        }
       }
 
       // Day 16: Update synchronization correlation engine
@@ -1444,6 +1819,7 @@ function CameraPreview() {
       // Speaking generates RMS values mostly under 0.25. Multiply by 4.0
       // to make it more responsive and visually distinct, then clamp to [0, 1].
       const normalizedEnergy = Math.min(rms * 4.0, 1.0);
+      latestAudioEnergyRef.current = normalizedEnergy;
       setAudioEnergy(normalizedEnergy);
 
       // Push to rolling FIFO buffer of 100 entries
@@ -1591,6 +1967,7 @@ function CameraPreview() {
       
       setFinalSummary({
         ...sessionSummaryRef.current,
+        language: backendSyncResult?.language || selectedLanguageRef.current || 'en',
         phraseVerificationStatus: phraseVerificationStatus,
         overallScore: phraseSimilarity,
         characterSimilarity: characterSimilarity,
@@ -1646,6 +2023,11 @@ function CameraPreview() {
       setStatus('unsupported');
       setErrorMsg('Your browser does not support webcam streaming APIs.');
       return;
+    }
+
+    // Ensure any previous session streams/tracks are fully released before starting a new authentication
+    if (streamRef.current || audioStreamRef.current) {
+      await stopStreamsImmediately();
     }
 
     setIsVerifying(true);
@@ -1729,11 +2111,25 @@ function CameraPreview() {
     
     // Clear state triggers to clean up and restore UI on error
     if (streamRef.current) {
-      streamRef.current.getTracks().forEach(t => t.stop());
+      streamRef.current.getTracks().forEach(t => {
+        t.enabled = false;
+        t.stop();
+      });
       streamRef.current = null;
+    }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+    if (audioStreamRef.current) {
+      audioStreamRef.current.getTracks().forEach(t => {
+        t.enabled = false;
+        t.stop();
+      });
+      audioStreamRef.current = null;
     }
 
     setIsVerifying(false);
+    isVerifyingRef.current = false;
 
     switch (errorName) {
       case 'NotAllowedError':
@@ -1822,668 +2218,1202 @@ function CameraPreview() {
     };
   }, []);
 
-  return (
-    <div className="camera-box-container">
-      {/* Real-time detection status bar (green/red indicators) */}
-      {status === 'active' && (
-        <div className={`detection-status-bar ${faceDetected ? 'detected' : 'not-detected'}`}>
-          <span className="detection-status-dot"></span>
-          <span>{faceDetected ? 'Face Detected' : 'No Face Detected'}</span>
-        </div>
-      )}
+  /**
+   * Renders a responsive SVG time-series graph comparing normalized Lip Movement (0-1)
+   * and normalized Audio Energy (0-1) over time (seconds).
+   */
+  const renderSignalWaveformGraph = (points = [], maxDurationSec = 5.0, badgeLabel = '') => {
+    const svgW = 500;
+    const svgH = 148;
+    const padLeft = 30;
+    const padRight = 14;
+    const padTop = 14;
+    const padBottom = 24;
+    const plotW = svgW - padLeft - padRight;
+    const plotH = svgH - padTop - padBottom;
 
-      {/* 1. Camera Frame Viewport */}
-      <div className={`camera-preview-wrapper ${status === 'active' ? 'active' : ''} ${['denied', 'unavailable', 'unsupported'].includes(status) ? 'error' : ''}`}>
-        
-        {/* Analyzing Overlay */}
-        {phraseVerificationLoading && (
-          <div className="camera-placeholder analyzing-container" style={{ zIndex: 10 }}>
-            <div className="camera-spinner"></div>
-            <div className="camera-placeholder-title">Analyzing...</div>
-            <p className="camera-placeholder-text">
-              Comparing your voice and lip movements for synchronization. Please wait.
-            </p>
+    const maxPointTime = points.length > 0 ? Math.max(...points.map(p => p.tSec)) : 0;
+    const effectiveMaxSec = Math.max(maxDurationSec, maxPointTime, 1.0);
+
+    const toX = (tSec) =>
+      padLeft + Math.min(1, Math.max(0, tSec / effectiveMaxSec)) * plotW;
+    const toY = (normVal) =>
+      padTop + (1 - Math.min(1, Math.max(0, normVal))) * plotH;
+
+    const hasLine = points.length >= 2;
+    const lipPolyline = hasLine
+      ? points.map(p => `${toX(p.tSec).toFixed(1)},${toY(p.lipNorm).toFixed(1)}`).join(' ')
+      : '';
+    const audioPolyline = hasLine
+      ? points.map(p => `${toX(p.tSec).toFixed(1)},${toY(p.audioNorm).toFixed(1)}`).join(' ')
+      : '';
+
+    const baselineY = (padTop + plotH).toFixed(1);
+    const firstX = hasLine ? toX(points[0].tSec).toFixed(1) : padLeft;
+    const lastX = hasLine ? toX(points[points.length - 1].tSec).toFixed(1) : padLeft;
+
+    const lipAreaPoints = hasLine
+      ? `${firstX},${baselineY} ${lipPolyline} ${lastX},${baselineY}`
+      : '';
+    const audioAreaPoints = hasLine
+      ? `${firstX},${baselineY} ${audioPolyline} ${lastX},${baselineY}`
+      : '';
+
+    const lastPt = hasLine ? points[points.length - 1] : null;
+    const timeTicks = [0, 1, 2, 3, 4, 5].map(i =>
+      Number(((i / 5) * effectiveMaxSec).toFixed(1))
+    );
+
+    return (
+      <div className="sync-waveform-card">
+        <div className="sync-waveform-header">
+          <div className="sync-waveform-title-wrap">
+            <span className="sync-waveform-title">📈 Lip Movement vs. Audio Signal (Normalized)</span>
+            {badgeLabel && <span className="sync-waveform-mode-badge">{badgeLabel}</span>}
           </div>
-        )}
-
-        {/* Badges and overlays */}
-        {status === 'active' && (
-          <>
-            <div className="camera-badge-container">
-              <div className="camera-badge live">
-                <span className="camera-badge-dot"></span>
-                LIVE CAMERA
-              </div>
-              {micStatus === 'active' && (
-                <div className="camera-badge live-mic">
-                  <span className="mic-badge-dot"></span>
-                  LIVE MICROPHONE
-                </div>
-              )}
-            </div>
-            <div className="fps-badge">
-              FPS: <span className="fps-value">{fps}</span>
-            </div>
-          </>
-        )}
-
-        {status === 'off' && (
-          <div className="camera-badge-container">
-            <div className="camera-badge off">
-              OFFLINE
-            </div>
-          </div>
-        )}
-
-        {/* Video Element */}
-        <video
-          ref={videoRef}
-          className="camera-video"
-          autoPlay
-          playsInline
-          muted
-          style={{ display: status === 'active' ? 'block' : 'none' }}
-        />
-
-        {/* Canvas Landmark Overlay */}
-        {status === 'active' && (
-          <canvas
-            ref={canvasRef}
-            className="camera-canvas"
-          />
-        )}
-
-        {/* 2. UI State Fallbacks */}
-        {status === 'off' && showSummaryCard && finalSummary && (
-          <div className="camera-placeholder summary-card-container">
-            <div className="summary-card-header">
-              <h3>📄 Session Summary</h3>
-              <div className={`summary-result-badge status-${finalResult.toLowerCase()}`}>
-                Result: {finalResult}
-              </div>
-            </div>
-            
-            <div className="summary-stats-grid">
-              <div className="summary-stat-item">
-                <span className="summary-stat-label">Valid Sync Frames</span>
-                <span className="summary-stat-value">{finalSummary.backendSyncResult?.validFrames ?? 0}</span>
-              </div>
-              <div className="summary-stat-item">
-                <span className="summary-stat-label">Ignored Sync Frames</span>
-                <span className="summary-stat-value">{finalSummary.backendSyncResult?.ignoredFrames ?? 0}</span>
-              </div>
-              <div className="summary-stat-item">
-                <span className="summary-stat-label">Lip Movement Variation</span>
-                <span className="summary-stat-value">{(finalSummary.lipVariation ?? 0).toFixed(3)}</span>
-              </div>
-              <div className="summary-stat-item" style={{ gridColumn: 'span 2' }}>
-                <span className="summary-stat-label">Verification Basis</span>
-                <span className="summary-stat-value phrase-text-summary">
-                  {finalSummary.verificationReason || finalSummary.reason || (finalResult === 'LIVE'
-                    ? 'Lip-voice synchronization and speech verification passed.'
-                    : 'Lip-voice synchronization or speech verification failed.')}
-                </span>
-              </div>
-              <div className="summary-stat-item" style={{ gridColumn: 'span 2' }}>
-                <span className="summary-stat-label">Displayed Challenge</span>
-                <span className="summary-stat-value phrase-text-summary">"{finalSummary.expectedPhrase}"</span>
-              </div>
-              <div className="summary-stat-item" style={{ gridColumn: 'span 2' }}>
-                <span className="summary-stat-label">Recognized Spoken Phrase</span>
-                <span className="summary-stat-value phrase-text-summary">"{finalSummary.spokenPhrase || 'No speech was recognized.'}"</span>
-              </div>
-              <div className="summary-stat-item" style={{ gridColumn: 'span 2' }}>
-                <span className="summary-stat-label">Session Duration</span>
-                <span className="summary-stat-value">{finalSummary.duration.toFixed(1)}s</span>
-              </div>
-              {/* Synchronization detailed stats */}
-              {finalSummary.backendSyncResult && (
-                <>
-                  <div className="summary-stat-item">
-                    <span className="summary-stat-label">Sync Score</span>
-                    <span className="summary-stat-value">{finalSummary.backendSyncResult.alignedCorrelation.toFixed(3)}</span>
-                  </div>
-                  <div className="summary-stat-item">
-                    <span className="summary-stat-label">Raw Score</span>
-                    <span className="summary-stat-value">{finalSummary.backendSyncResult.rawCorrelation.toFixed(3)}</span>
-                  </div>
-                  <div className="summary-stat-item">
-                    <span className="summary-stat-label">Time Offset</span>
-                    <span className="summary-stat-value">{finalSummary.backendSyncResult.detectedTimeOffsetMs}ms</span>
-                  </div>
-                  <div className="summary-stat-item">
-                    <span className="summary-stat-label">Duration Diff</span>
-                    <span className="summary-stat-value">{finalSummary.backendSyncResult.durationDifferenceMs}ms</span>
-                  </div>
-                  <div className="summary-stat-item">
-                    <span className="summary-stat-label">Audio Duration</span>
-                    <span className="summary-stat-value">
-                      {(finalSummary.backendSyncResult.audioDurationMs / 1000).toFixed(2)}s
-                    </span>
-                  </div>
-                  <div className="summary-stat-item">
-                    <span className="summary-stat-label">Lip Duration</span>
-                    <span className="summary-stat-value">
-                      {(finalSummary.backendSyncResult.lipDurationMs / 1000).toFixed(2)}s
-                    </span>
-                  </div>
-                  <div className="summary-stat-item">
-                    <span className="summary-stat-label">Valid Frames</span>
-                    <span className="summary-stat-value">{finalSummary.backendSyncResult.validFrames}</span>
-                  </div>
-                  <div className="summary-stat-item">
-                    <span className="summary-stat-label">Ignored Frames</span>
-                    <span className="summary-stat-value">{finalSummary.backendSyncResult.ignoredFrames}</span>
-                  </div>
-                  <div className="summary-stat-item" style={{ gridColumn: 'span 2' }}>
-                    <span className="summary-stat-label">Average Audio Energy</span>
-                    <span className="summary-stat-value">{finalSummary.backendSyncResult.averageAudioEnergy.toFixed(4)}</span>
-                  </div>
-                  <div className="summary-stat-item" style={{ gridColumn: 'span 2' }}>
-                    <span className="summary-stat-label">Challenge Phrase</span>
-                    <span className="summary-stat-value phrase-text-summary">"{finalSummary.expectedPhrase}"</span>
-                  </div>
-                </>
-              )}
-            </div>
-            
-            <div className="challenge-controls">
-              <button
-                className="btn-secondary"
-                onClick={() => {
-                  setShowSummaryCard(false);
-                  setFinalSummary(null);
-                  setFinalResult('');
-                }}
-              >
-                Close
-              </button>
-              <button 
-                className="btn-primary summary-dismiss-btn"
-                onClick={() => {
-                  setShowSummaryCard(false);
-                  setFinalSummary(null);
-                  startCamera();
-                }}
-              >
-                Start New Authentication
-              </button>
-            </div>
-          </div>
-        )}
-
-        {status === 'off' && phraseVerificationLoading && (
-          <div className="camera-placeholder verifying">
-            <div className="camera-spinner"></div>
-            <div className="camera-placeholder-title">Processing Verification</div>
-            <p className="camera-placeholder-text">
-              Analyzing audio patterns and transcribing speech. Please wait...
-            </p>
-          </div>
-        )}
-
-        {status === 'off' && !phraseVerificationLoading && (!showSummaryCard || !finalSummary) && (
-          <div className="camera-placeholder">
-            <div className="camera-placeholder-icon">📹</div>
-            <div className="camera-placeholder-title">Camera Off</div>
-            <p className="camera-placeholder-text">
-              The camera feed is currently disabled. Click "Start Authentication" below to request access.
-            </p>
-          </div>
-        )}
-
-        {status === 'requesting' && (
-          <div className="camera-placeholder">
-            <div className="camera-spinner"></div>
-            <div className="camera-placeholder-title">Requesting Camera Permission</div>
-            <p className="camera-placeholder-text">
-              Please click "Allow" on the browser pop-up prompt to activate your camera.
-            </p>
-          </div>
-        )}
-
-        {status === 'denied' && (
-          <div className="camera-placeholder camera-error-container">
-            <div className="camera-placeholder-icon">🔒</div>
-            <div className="camera-placeholder-title">Permission Denied</div>
-            <p className="camera-placeholder-text">{errorMsg}</p>
-            <div className="camera-instructions">
-              💡 Tip: Click the camera icon in your address bar to reset camera permissions, then reload.
-            </div>
-          </div>
-        )}
-
-        {status === 'unavailable' && (
-          <div className="camera-placeholder camera-error-container">
-            <div className="camera-placeholder-icon">⚠️</div>
-            <div className="camera-placeholder-title">Camera Not Available</div>
-            <p className="camera-placeholder-text">{errorMsg}</p>
-            <div className="camera-instructions">
-              💡 Tip: Make sure the camera is connected and not currently used by Zoom, Teams, or another page.
-            </div>
-          </div>
-        )}
-
-        {status === 'unsupported' && (
-          <div className="camera-placeholder camera-error-container">
-            <div className="camera-placeholder-icon">🚫</div>
-            <div className="camera-placeholder-title">Browser Not Supported</div>
-            <p className="camera-placeholder-text">{errorMsg}</p>
-            <div className="camera-instructions">
-              💡 Tip: Open this application in Google Chrome, Mozilla Firefox, or Microsoft Edge.
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* Premium Glassmorphic Challenge Card */}
-      {status === 'active' && challengePhrase && (
-        <div className="challenge-card glassmorphic">
-          <div className="challenge-card-header">
-            <span className="challenge-icon">🔐</span>
-            <div className="challenge-title-group">
-              <h3 className="challenge-card-title">Random Speech Challenge</h3>
-            </div>
-            <span className={`challenge-status-badge status-${challengeStatus.toLowerCase()}`}>
-              {challengeStatus}
+          <div className="sync-waveform-legend">
+            <span className="legend-item">
+              <span className="legend-swatch lip-swatch"></span>
+              Lip Signal
+            </span>
+            <span className="legend-item">
+              <span className="legend-swatch audio-swatch"></span>
+              Audio Signal
             </span>
           </div>
-
-          <div className="challenge-phrase-box">
-            <div className="challenge-phrase-label">Speak the phrase clearly:</div>
-            <div className={`challenge-phrase-text ${challengeStatus === 'RECORDING' ? 'recording' : ''}`}>
-              "{displayedChallenge}"
-            </div>
-          </div>
-
-          <div className="challenge-timer-section">
-            {challengeStatus !== 'RECORDING' && challengeStatus !== 'COMPLETED' ? (
-              <>
-                <div className="timer-info">
-                  <span className="timer-text">Phrase expires in: <strong>{challengeTimeLeft}s</strong></span>
-                </div>
-                <div className="timer-progress-container">
-                  <div 
-                    className="timer-progress-bar" 
-                    style={{ width: `${(challengeTimeLeft / 30) * 100}%` }}
-                  ></div>
-                </div>
-              </>
-            ) : challengeStatus === 'RECORDING' ? (
-              <div className="recording-indicator">
-                <span className="recording-dot pulse"></span>
-                <span>Recording in progress... Keep speaking the phrase</span>
-              </div>
-            ) : (
-              <div className="completed-indicator">
-                <span className="completed-icon">✅</span>
-                <span>Recording captured. Sending it for speech and lip-voice verification.</span>
-              </div>
-            )}
-          </div>
-
-          <div className="challenge-controls">
-            {challengeStatus === 'RECORDING' ? (
-              <>
-                <div className="recording-duration">Recording time: {recordingTime}s</div>
-                <button
-                  className="btn-stop-record"
-                  onClick={stopRecording}
-                >
-                  Stop Recording &amp; Verify
-                </button>
-              </>
-            ) : (
-              <button 
-                className="btn-start-record" 
-                disabled={!faceDetected || (phraseVerificationStatus && phraseVerificationStatus !== '')}
-                title={phraseVerificationStatus ? "Verification completed" : !faceDetected ? "Position face in camera to record" : "Start Recording"}
-                onClick={startRecording}
-              >
-                Start Recording
-              </button>
-            )}
-          </div>
         </div>
-      )}
 
-      {/* Premium Glassmorphic Challenge Verification Card */}
-      {false && status === 'active' && (phraseVerificationLoading || phraseVerificationStatus || verificationError) && (
-        <div className="verification-card glassmorphic">
-          <div className="verification-card-header">
-            <span className="verification-icon">🗣️</span>
-            <div className="verification-title-group">
-              <h3 className="verification-card-title">Phrase Verification</h3>
-              {backendProcessingTime > 0 && !phraseVerificationLoading && (
-                <span className="processing-time-display">
-                  Backend time: {backendProcessingTime}ms
-                </span>
-              )}
-            </div>
-            {phraseVerificationLoading ? (
-              <span className="verification-status-badge status-loading">
-                {verificationStage}
-              </span>
+        <div className="sync-waveform-svg-wrap">
+          <svg
+            viewBox={`0 0 ${svgW} ${svgH}`}
+            className="sync-waveform-svg"
+            preserveAspectRatio="none"
+          >
+            <defs>
+              <linearGradient id="lipSignalGrad" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor="#0D9488" stopOpacity="0.22" />
+                <stop offset="100%" stopColor="#0D9488" stopOpacity="0.0" />
+              </linearGradient>
+              <linearGradient id="audioSignalGrad" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor="#2563EB" stopOpacity="0.18" />
+                <stop offset="100%" stopColor="#2563EB" stopOpacity="0.0" />
+              </linearGradient>
+            </defs>
+
+            {/* Horizontal amplitude grid lines (1.0, 0.5, 0.0) */}
+            {[1.0, 0.5, 0.0].map((val) => {
+              const y = toY(val);
+              return (
+                <g key={`y-${val}`}>
+                  <line
+                    x1={padLeft}
+                    y1={y}
+                    x2={svgW - padRight}
+                    y2={y}
+                    stroke="#E2E8F0"
+                    strokeDasharray={val === 0.5 ? '3 3' : undefined}
+                    strokeWidth="1"
+                  />
+                  <text
+                    x={padLeft - 6}
+                    y={y + 3}
+                    textAnchor="end"
+                    fill="#64748B"
+                    fontSize="9"
+                    fontWeight="500"
+                  >
+                    {val.toFixed(1)}
+                  </text>
+                </g>
+              );
+            })}
+
+            {/* Vertical time grid lines (0s to 5s) */}
+            {timeTicks.map((tVal, idx) => {
+              const x = padLeft + (idx / 5) * plotW;
+              return (
+                <g key={`x-${idx}`}>
+                  <line
+                    x1={x}
+                    y1={padTop}
+                    x2={x}
+                    y2={padTop + plotH}
+                    stroke="#F1F5F9"
+                    strokeWidth="1"
+                  />
+                  <text
+                    x={x}
+                    y={svgH - 6}
+                    textAnchor="middle"
+                    fill="#64748B"
+                    fontSize="9"
+                    fontWeight="500"
+                  >
+                    {tVal}s
+                  </text>
+                </g>
+              );
+            })}
+
+            {hasLine ? (
+              <>
+                <polygon points={audioAreaPoints} fill="url(#audioSignalGrad)" />
+                <polygon points={lipAreaPoints} fill="url(#lipSignalGrad)" />
+                <polyline
+                  fill="none"
+                  stroke="#2563EB"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  points={audioPolyline}
+                />
+                <polyline
+                  fill="none"
+                  stroke="#0D9488"
+                  strokeWidth="2.2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  points={lipPolyline}
+                />
+                {lastPt && (
+                  <>
+                    <circle
+                      cx={toX(lastPt.tSec)}
+                      cy={toY(lastPt.audioNorm)}
+                      r="3"
+                      fill="#2563EB"
+                    />
+                    <circle
+                      cx={toX(lastPt.tSec)}
+                      cy={toY(lastPt.lipNorm)}
+                      r="3.2"
+                      fill="#0D9488"
+                    />
+                  </>
+                )}
+              </>
             ) : (
-              <span className={`verification-status-badge status-${phraseVerificationStatus.toLowerCase()}`}>
-                {phraseVerificationStatus || 'UNKNOWN'}
-              </span>
+              <text
+                x={padLeft + plotW / 2}
+                y={padTop + plotH / 2 + 3}
+                textAnchor="middle"
+                fill="#64748B"
+                fontSize="10.5"
+              >
+                Waiting for synchronized lip and audio signal frames...
+              </text>
             )}
-          </div>
+          </svg>
+        </div>
+      </div>
+    );
+  };
 
-          {phraseVerificationLoading ? (
-            <div className="verification-loading-container">
-              <div className="loading-spinner"></div>
-              <p className="stage-indicator">
-                {verificationStage === 'UPLOADING' && 'Uploading recording...'}
-                {verificationStage === 'TRANSCRIBING' && 'Transcribing speech with Whisper...'}
-                {verificationStage === 'VERIFYING' && 'Analyzing phrase similarity...'}
-              </p>
-            </div>
-          ) : verificationError ? (
-            <div className="verification-error-container">
-              <span className="error-icon">⚠️</span>
-              <p className="verification-error-msg">{verificationError}</p>
-            </div>
-          ) : (
-            <>
-              <div className="verification-grid">
-                <div className="verification-item">
-                  <span className="verification-label">Expected Phrase</span>
-                  <div className="expected-phrase">"{activeChallengeRef.current}"</div>
-                </div>
-                <div className="verification-item">
-                  <span className="verification-label">Recognized Speech</span>
-                  <div className="recognized-phrase">
-                    {recognizedText ? `"${recognizedText}"` : <span className="text-muted">Silence (No speech detected)</span>}
-                  </div>
-                </div>
-                <div className="verification-item full-width">
-                  <span className="verification-label">Overall Score</span>
-                  <div className="similarity-container">
-                    <div className="similarity-score">{phraseSimilarity.toFixed(1)}%</div>
-                    <div className="similarity-bar-container">
-                      <div 
-                        className={`similarity-bar status-${phraseVerificationStatus.toLowerCase()}`}
-                        style={{ width: `${phraseSimilarity}%` }}
-                      ></div>
-                    </div>
-                  </div>
-                </div>
-              </div>
+  return (
+    <div className="camera-box-container">
+      {/* 0. Multilingual Challenge-Response Selector Bar */}
+      <div className="language-selector-bar">
+        <div className="language-selector-label-group">
+          <span className="language-selector-icon">🌐</span>
+          <span className="language-selector-title">Challenge Language:</span>
+          <span className="language-selector-active-sub">
+            {getLanguageMeta(selectedLanguage).englishName} ({getLanguageMeta(selectedLanguage).label})
+          </span>
+        </div>
+        <div className="language-selector-options" role="radiogroup" aria-label="Select challenge language">
+          {LANGUAGE_OPTIONS.map((lang) => {
+            const isSelected = selectedLanguage === lang.code;
+            return (
+              <button
+                key={lang.code}
+                type="button"
+                role="radio"
+                aria-checked={isSelected}
+                disabled={isRecording || phraseVerificationLoading}
+                className={`language-option-btn ${isSelected ? 'active' : ''}`}
+                onClick={() => handleLanguageChange(lang.code)}
+              >
+                <span className="language-native-label">{lang.label}</span>
+                {lang.code !== 'en' && (
+                  <span className="language-en-sub">{lang.englishName}</span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+      </div>
 
-              {/* Detailed Breakdown */}
-              <div className="similarity-details">
-                <div className="detail-item">
-                  <span className="detail-label">Char Similarity:</span>
-                  <span className="detail-value">{characterSimilarity.toFixed(1)}%</span>
-                </div>
-                <div className="detail-item">
-                  <span className="detail-label">Word Match:</span>
-                  <span className="detail-value">{wordSimilarity.toFixed(1)}%</span>
-                </div>
-                <div className="detail-item">
-                  <span className="detail-label">Whisper Confidence:</span>
-                  <span className="detail-value">{(whisperConfidence * 100).toFixed(1)}%</span>
-                </div>
-                {recordingDuration > 0 && (
-                  <div className="detail-item">
-                    <span className="detail-label">Audio Duration:</span>
-                    <span className="detail-value">{(recordingDuration / 1000).toFixed(2)}s</span>
+      {/* Main Two-Column Layout Grid */}
+      <div className="livescan-main-grid">
+        {/* Left Column: Camera Preview, Controls & Real-Time Sensors */}
+        <div className="col-camera">
+          {/* 1. Camera Card */}
+          <div className="camera-card">
+            {/* Camera Card Top Header: Status Badges & Hardware Telemetry */}
+            <div className="camera-card-header">
+              <div className="camera-card-header-left">
+                {status === 'active' ? (
+                  <div className={`detection-status-bar ${faceDetected ? 'detected' : 'not-detected'}`}>
+                    <span className="detection-status-dot"></span>
+                    <span>{faceDetected ? 'Face Detected' : 'No Face Detected'}</span>
+                  </div>
+                ) : (
+                  <div className="detection-status-bar offline">
+                    <span className="detection-status-dot"></span>
+                    <span>Camera Standby</span>
                   </div>
                 )}
               </div>
-            </>
-          )}
 
-          {/* Verification History Collapsible Accordion */}
-          {verificationHistory.length > 0 && (
-            <div className="history-panel">
-              <button 
-                className="history-toggle"
-                onClick={() => setIsHistoryCollapsed(!isHistoryCollapsed)}
-              >
-                <span>📊 Verification History ({verificationHistory.length})</span>
-                <span className="toggle-icon">{isHistoryCollapsed ? '▼' : '▲'}</span>
-              </button>
-              
-              {!isHistoryCollapsed && (
-                <div className="history-list">
-                  {verificationHistory.map((item, idx) => (
-                    <div className="history-item" key={idx}>
-                      <div className="history-item-header">
-                        <span className="history-time">{item.timestamp}</span>
-                        <span className={`history-status status-${item.status.toLowerCase()}`}>
-                          {item.status} ({item.overallScore.toFixed(1)}%)
+              <div className="camera-card-header-right">
+                {status === 'active' && (
+                  <>
+                    <div className="camera-badge-container-inline">
+                      <span className="camera-badge live">
+                        <span className="camera-badge-dot"></span>
+                        LIVE CAM
+                      </span>
+                      {micStatus === 'active' && (
+                        <span className="camera-badge live-mic">
+                          <span className="mic-badge-dot"></span>
+                          LIVE MIC
                         </span>
-                      </div>
-                      <div className="history-item-body">
-                        <div><small>Expected:</small> <span className="history-phrase">"{item.expectedPhrase}"</span></div>
-                        <div><small>Recognized:</small> <span className="history-phrase">"{item.recognizedText || 'Silence'}"</span></div>
-                      </div>
+                      )}
                     </div>
-                  ))}
+                    <div className="fps-badge-inline">
+                      FPS: <span className="fps-value">{fps}</span>
+                    </div>
+                  </>
+                )}
+                {status === 'off' && (
+                  <span className="camera-badge off">OFFLINE</span>
+                )}
+              </div>
+            </div>
+
+            {/* Strict 4:3 Viewport (Zero Height Shift Between States) */}
+            <div className={`camera-viewport ${status === 'active' ? 'active' : ''} ${['denied', 'unavailable', 'unsupported'].includes(status) ? 'error' : ''}`}>
+              {/* Analyzing Overlay */}
+              {phraseVerificationLoading && (
+                <div className="camera-placeholder analyzing-container" style={{ zIndex: 10 }}>
+                  <div className="camera-spinner"></div>
+                  <div className="camera-placeholder-title">Analyzing Signals...</div>
+                  <p className="camera-placeholder-text">
+                    Comparing your voice and lip movements for synchronization. Please wait.
+                  </p>
+                </div>
+              )}
+
+              {/* Video Element */}
+              <video
+                ref={videoRef}
+                className="camera-video"
+                autoPlay
+                playsInline
+                muted
+                style={{ display: status === 'active' ? 'block' : 'none' }}
+              />
+
+              {/* Landmark Canvas Overlay */}
+              {status === 'active' && (
+                <canvas
+                  ref={canvasRef}
+                  className="camera-canvas"
+                />
+              )}
+
+              {/* Offline Placeholder */}
+              {status === 'off' && !phraseVerificationLoading && (
+                <div className="camera-placeholder">
+                  <div className="camera-placeholder-icon">📹</div>
+                  <div className="camera-placeholder-title">Camera Feed Ready</div>
+                  <p className="camera-placeholder-text">
+                    Select your preferred language above and click "Start Authentication" below to initialize webcam and microphone.
+                  </p>
+                </div>
+              )}
+
+              {/* Requesting Permission */}
+              {status === 'requesting' && (
+                <div className="camera-placeholder">
+                  <div className="camera-spinner"></div>
+                  <div className="camera-placeholder-title">Requesting Permission</div>
+                  <p className="camera-placeholder-text">
+                    Please click "Allow" on the browser prompt to activate your camera and microphone.
+                  </p>
+                </div>
+              )}
+
+              {/* Permission Denied */}
+              {status === 'denied' && (
+                <div className="camera-placeholder camera-error-container">
+                  <div className="camera-placeholder-icon">🔒</div>
+                  <div className="camera-placeholder-title">Permission Denied</div>
+                  <p className="camera-placeholder-text">{errorMsg}</p>
+                  <div className="camera-instructions">
+                    💡 Tip: Click the camera icon in your address bar to reset camera permissions, then reload.
+                  </div>
+                </div>
+              )}
+
+              {/* Unavailable */}
+              {status === 'unavailable' && (
+                <div className="camera-placeholder camera-error-container">
+                  <div className="camera-placeholder-icon">⚠️</div>
+                  <div className="camera-placeholder-title">Camera Not Available</div>
+                  <p className="camera-placeholder-text">{errorMsg}</p>
+                  <div className="camera-instructions">
+                    💡 Tip: Make sure the camera is connected and not currently used by Zoom, Teams, or another page.
+                  </div>
+                </div>
+              )}
+
+              {/* Unsupported */}
+              {status === 'unsupported' && (
+                <div className="camera-placeholder camera-error-container">
+                  <div className="camera-placeholder-icon">🚫</div>
+                  <div className="camera-placeholder-title">Browser Not Supported</div>
+                  <p className="camera-placeholder-text">{errorMsg}</p>
+                  <div className="camera-instructions">
+                    💡 Tip: Open this application in Google Chrome, Mozilla Firefox, or Microsoft Edge.
+                  </div>
                 </div>
               )}
             </div>
+
+            {/* Camera Actions & Permissions Info */}
+            <div className="camera-card-actions">
+              {status === 'active' || status === 'requesting' || ['denied', 'unavailable', 'unsupported'].includes(status) ? (
+                <button className="btn-danger" onClick={stopCamera}>
+                  Stop Camera
+                </button>
+              ) : (
+                <button
+                  className="btn-primary"
+                  onClick={() => {
+                    setIsCalibrationMode(false);
+                    isCalibrationModeRef.current = false;
+                    startCamera();
+                  }}
+                >
+                  Start Authentication
+                </button>
+              )}
+
+              <div className="info-notes">
+                <div className="info-item">
+                  <span className="info-icon">📹</span>
+                  <span className="info-text">MediaPipe FaceMesh mouth tracking</span>
+                </div>
+                <div className="info-item">
+                  <span className="info-icon">🎙️</span>
+                  <span className="info-text">Real-time voice sync check</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Real-Time Lip Movement Metrics (When Active) */}
+          {status === 'active' && (
+            <div className="metrics-dashboard">
+              <div className="metrics-header">
+                <h3>👄 Lip Movement Metrics</h3>
+                <span className={`metrics-status-badge ${faceDetected ? 'active' : 'inactive'}`}>
+                  {faceDetected ? 'Tracking Active' : 'Waiting for Face...'}
+                </span>
+              </div>
+
+              <div className="metrics-grid">
+                <div className="metric-card">
+                  <span className="metric-label">Vertical Distance</span>
+                  <div className="metric-value-container">
+                    <span className="metric-value">{metrics.verticalDistance.toFixed(4)}</span>
+                    <span className="metric-unit">norm</span>
+                  </div>
+                  <div className="metric-bar-container">
+                    <div 
+                      className="metric-bar vertical-bar" 
+                      style={{ width: `${Math.min(metrics.verticalDistance * 800, 100)}%` }}
+                    ></div>
+                  </div>
+                </div>
+
+                <div className="metric-card">
+                  <span className="metric-label">Horizontal Distance</span>
+                  <div className="metric-value-container">
+                    <span className="metric-value">{metrics.horizontalDistance.toFixed(4)}</span>
+                    <span className="metric-unit">norm</span>
+                  </div>
+                  <div className="metric-bar-container">
+                    <div 
+                      className="metric-bar horizontal-bar" 
+                      style={{ width: `${Math.min(metrics.horizontalDistance * 600, 100)}%` }}
+                    ></div>
+                  </div>
+                </div>
+
+                <div className="metric-card highlighted-card">
+                  <span className="metric-label">Lip Opening Ratio</span>
+                  <div className="metric-value-container">
+                    <span className="metric-value highlighted-value">{metrics.lipOpeningRatio.toFixed(3)}</span>
+                    <span className="metric-unit">V/H</span>
+                  </div>
+                  <div className="metric-bar-container ratio-bar-container">
+                    <div 
+                      className="metric-bar ratio-bar" 
+                      style={{ width: `${Math.min(metrics.lipOpeningRatio * 150, 100)}%` }}
+                    ></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Real-Time Audio Capture Metrics (When Active) */}
+          {status === 'active' && (
+            <div className="metrics-dashboard audio-dashboard">
+              <div className="metrics-header">
+                <h3>🎙️ Audio Capture Metrics</h3>
+                <span className={`metrics-status-badge mic-${micStatus}`}>
+                  {micStatus === 'active' && 'Microphone Active'}
+                  {micStatus === 'requesting' && 'Requesting Mic...'}
+                  {micStatus === 'denied' && 'Mic Permission Denied'}
+                  {micStatus === 'unavailable' && 'Mic Device Not Found'}
+                  {micStatus === 'off' && 'Microphone Off'}
+                </span>
+              </div>
+
+              <div className="metrics-grid mic-grid">
+                <div className="metric-card">
+                  <span className="metric-label">Audio Energy</span>
+                  <div className="metric-value-container">
+                    <span className="metric-value">{audioEnergy.toFixed(4)}</span>
+                    <span className="metric-unit">RMS</span>
+                  </div>
+                </div>
+
+                <div className="metric-card">
+                  <span className="metric-label">Audio Buffer Size</span>
+                  <div className="metric-value-container">
+                    <span className="metric-value">{audioBufferRef.current.length}</span>
+                    <span className="metric-unit">frames</span>
+                  </div>
+                </div>
+
+                <div className="metric-card highlighted-card mic-energy-card">
+                  <span className="metric-label">Live Volume Meter</span>
+                  <div className="metric-value-container">
+                    <span className="metric-value highlighted-value mic-energy-value">{Math.round(audioEnergy * 100)}%</span>
+                  </div>
+                  <div className="metric-bar-container mic-energy-bar-container">
+                    <div 
+                      className="metric-bar mic-energy-bar" 
+                      style={{ width: `${audioEnergy * 100}%` }}
+                    ></div>
+                  </div>
+                </div>
+              </div>
+            </div>
           )}
         </div>
-      )}
 
-      {/* Real-time Lip Movement Metrics Dashboard */}
-      {status === 'active' && (
-        <div className="metrics-dashboard">
-          <div className="metrics-header">
-            <h3>👄 Lip Movement Metrics</h3>
-            <span className={`metrics-status-badge ${faceDetected ? 'active' : 'inactive'}`}>
-              {faceDetected ? 'Tracking Active' : 'Waiting for Face...'}
-            </span>
-          </div>
-
-          <div className="metrics-grid">
-            <div className="metric-card">
-              <span className="metric-label">Vertical Distance</span>
-              <div className="metric-value-container">
-                <span className="metric-value">{metrics.verticalDistance.toFixed(4)}</span>
-                <span className="metric-unit">norm</span>
+        {/* Right Column: Verification Panel & Controls */}
+        <div className="col-verification">
+          {/* CASE A: Verification Result Summary (When Verification Completes) */}
+          {showSummaryCard && finalSummary && (
+            <div className="summary-card-container">
+              <div className="summary-card-header">
+                <h3>
+                  {finalSummary.wasCalibrationAttempt
+                    ? `🎯 Calibration Sample Result (${calibrationProfile?.validSamplesCount || 0} of ${calibrationProfile?.requiredSamples || DEFAULT_CALIBRATION_SAMPLES})`
+                    : '📄 Liveness Authentication Result'}
+                </h3>
+                <div className={`summary-result-badge status-${finalResult.toLowerCase()}`}>
+                  {finalSummary.wasCalibrationAttempt
+                    ? (finalResult === 'LIVE' ? '✅ SAMPLE ACCEPTED' : '❌ SAMPLE REJECTED')
+                    : (finalResult === 'LIVE' ? '✅ LIVE' : '❌ SPOOF')}
+                </div>
               </div>
-              <div className="metric-bar-container">
-                <div 
-                  className="metric-bar vertical-bar" 
-                  style={{ width: `${Math.min(metrics.verticalDistance * 800, 100)}%` }}
-                ></div>
+
+              {/* Active Threshold Mode Indicator Banner */}
+              {(() => {
+                const syncRes = finalSummary.backendSyncResult;
+                const isAdaptiveUsed = Boolean(syncRes?.adaptiveCalibrationUsed ?? calibrationProfile?.isCalibrated);
+                const effThresh = Number(syncRes?.effectiveThreshold ?? calibrationProfile?.effectiveThreshold ?? BACKEND_LIVE_SYNC_THRESHOLD);
+                const globThresh = Number(syncRes?.globalThreshold ?? BACKEND_LIVE_SYNC_THRESHOLD);
+                const adapThresh = syncRes?.adaptiveThreshold ?? calibrationProfile?.adaptiveThreshold;
+                return (
+                  <div className={`threshold-mode-banner ${isAdaptiveUsed ? 'adaptive-active' : 'global-active'}`}>
+                    <span className="threshold-mode-pill">
+                      {isAdaptiveUsed ? 'Adaptive threshold active' : 'Global threshold active'}
+                    </span>
+                    <span className="threshold-mode-meta">
+                      Global: <strong>{globThresh.toFixed(2)}</strong> &middot;{' '}
+                      Adaptive: <strong>{adapThresh != null ? Number(adapThresh).toFixed(2) : 'N/A'}</strong> &middot;{' '}
+                      Effective: <strong>{effThresh.toFixed(2)}</strong>
+                    </span>
+                  </div>
+                );
+              })()}
+
+              {/* SPOOF Rejection Banner */}
+              {finalResult === 'SPOOF' && (
+                <div className="rejection-reason-box">
+                  <span className="rejection-reason-icon">⚠️</span>
+                  <div>
+                    <strong>
+                      {finalSummary.wasCalibrationAttempt
+                        ? 'Calibration Sample Rejected (Not Added to Baseline)'
+                        : 'Authentication Rejected (SPOOF)'}
+                    </strong>
+                    <span>{finalSummary.rejectionReason || finalSummary.verificationReason || 'Liveness criteria not satisfied.'}</span>
+                  </div>
+                </div>
+              )}
+
+              {/* LIVE Confirmation Banner */}
+              {finalResult === 'LIVE' && (
+                <div className="live-confirmation-box">
+                  <span className="live-confirmation-icon">🛡️</span>
+                  <div>
+                    <strong>
+                      {finalSummary.wasCalibrationAttempt
+                        ? (calibrationProfile?.isCalibrated
+                            ? `Calibration Complete! Effective Threshold: ${Number(calibrationProfile.effectiveThreshold).toFixed(2)}`
+                            : `Calibration Sample Accepted (${calibrationProfile?.validSamplesCount || 0} of ${calibrationProfile?.requiredSamples || DEFAULT_CALIBRATION_SAMPLES})`)
+                        : 'Authentication Approved (LIVE)'}
+                    </strong>
+                    <span>Spoken challenge phrase matched and physical lip-voice movement is synchronized.</span>
+                  </div>
+                </div>
+              )}
+
+              {/* Post-Verification Lip-Voice Synchronization Details */}
+              {(() => {
+                const syncRes = finalSummary.backendSyncResult;
+                const hasSyncRes = Boolean(syncRes);
+                const alignedVal = hasSyncRes ? Number(syncRes.alignedCorrelation || 0) : 0;
+                const rawVal = hasSyncRes ? Number(syncRes.rawCorrelation || 0) : 0;
+                const offsetVal = hasSyncRes && syncRes.detectedTimeOffsetMs !== undefined ? Number(syncRes.detectedTimeOffsetMs) : null;
+                const effectiveThresholdVal = Number(syncRes?.effectiveThreshold ?? calibrationProfile?.effectiveThreshold ?? BACKEND_LIVE_SYNC_THRESHOLD);
+                const isSynchronized = Boolean(syncRes?.isSyncValid);
+                const isCorrPass = hasSyncRes && alignedVal >= effectiveThresholdVal;
+                const isOffsetPass = offsetVal !== null && Math.abs(offsetVal) <= BACKEND_MAX_SYNC_OFFSET_MS;
+                const barPercent = Math.max(0, Math.min(alignedVal * 100, 100));
+                const resolvedLangCode = finalSummary.language || syncRes?.language || selectedLanguage;
+                const langMeta = getLanguageMeta(resolvedLangCode);
+                const isChallengePass = finalSummary.phraseVerificationStatus === 'PASS';
+
+                return (
+                  <div className="sync-analysis-panel">
+                    <div className="sync-Key-metrics-row">
+                      <div className="sync-key-card">
+                        <span className="sync-key-label">Sync Score</span>
+                        <span className={`sync-key-value ${hasSyncRes ? (isCorrPass ? 'text-success' : 'text-danger') : ''}`}>
+                          {hasSyncRes ? alignedVal.toFixed(3) : 'N/A'}
+                        </span>
+                        <span className="sync-key-sub">
+                          Effective &ge; {effectiveThresholdVal.toFixed(2)} &middot; Raw: {hasSyncRes ? rawVal.toFixed(3) : 'N/A'}
+                        </span>
+                      </div>
+
+                      <div className="sync-key-card">
+                        <span className="sync-key-label">Time Offset</span>
+                        <span className={`sync-key-value ${offsetVal !== null ? (isOffsetPass ? 'text-success' : 'text-danger') : ''}`}>
+                          {offsetVal !== null ? `${offsetVal > 0 ? '+' : ''}${offsetVal} ms` : 'N/A'}
+                        </span>
+                        <span className="sync-key-sub">
+                          Max allowed: &plusmn;{BACKEND_MAX_SYNC_OFFSET_MS} ms
+                        </span>
+                      </div>
+
+                      <div className="sync-key-card">
+                        <span className="sync-key-label">Sync Status</span>
+                        <span className={`sync-key-value ${isSynchronized ? 'text-success' : 'text-danger'}`}>
+                          {isSynchronized ? 'Synchronized' : 'Not Synchronized'}
+                        </span>
+                        <span className="sync-key-sub">
+                          Backend Verdict ({syncRes?.syncStatus || 'SPOOF'})
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* Multilingual Summary */}
+                    <div className="sync-multilingual-summary">
+                      <div className="sync-ml-row">
+                        <span className="sync-ml-label">Language:</span>
+                        <span className="sync-ml-value">
+                          {langMeta.englishName} ({langMeta.label})
+                        </span>
+                      </div>
+                      <div className="sync-ml-row">
+                        <span className="sync-ml-label">Challenge:</span>
+                        <span className="sync-ml-value phrase-highlight">
+                          {finalSummary.expectedPhrase || '—'}
+                        </span>
+                      </div>
+                      <div className="sync-ml-row">
+                        <span className="sync-ml-label">Recognized Speech:</span>
+                        <span className={`sync-ml-value ${isChallengePass ? 'text-success' : 'text-danger'}`}>
+                          {finalSummary.transcribedPhrase || finalSummary.recognizedText || 'No speech was recognized.'}
+                        </span>
+                      </div>
+                      <div className="sync-ml-row">
+                        <span className="sync-ml-label">Challenge Match:</span>
+                        <span className={`sync-ml-value ${isChallengePass ? 'text-success' : 'text-danger'}`}>
+                          {isChallengePass ? 'Matched' : 'Mismatched'} ({finalSummary.overallScore ? finalSummary.overallScore.toFixed(1) : 0}%)
+                        </span>
+                      </div>
+                      <div className="sync-ml-row">
+                        <span className="sync-ml-label">Sync Score:</span>
+                        <span className={`sync-ml-value ${hasSyncRes ? (isCorrPass ? 'text-success' : 'text-danger') : ''}`}>
+                          {hasSyncRes ? alignedVal.toFixed(3) : '0.000'}
+                        </span>
+                      </div>
+                      <div className="sync-ml-row">
+                        <span className="sync-ml-label">Time Offset:</span>
+                        <span className={`sync-ml-value ${offsetVal !== null ? (isOffsetPass ? 'text-danger' : 'text-danger') : ''}`}>
+                          {offsetVal !== null ? `${offsetVal} ms` : '0 ms'}
+                        </span>
+                      </div>
+                      <div className="sync-ml-row">
+                        <span className="sync-ml-label">Liveness Result:</span>
+                        <span className={`sync-ml-value ${finalResult === 'LIVE' ? 'text-success' : 'text-danger'}`}>
+                          {finalResult}
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* Visual Synchronization Threshold Bar */}
+                    <div className="sync-threshold-bar-box">
+                      <div className="sync-threshold-bar-labels">
+                        <span>Sync Score vs. Effective Threshold ({effectiveThresholdVal.toFixed(2)})</span>
+                        <strong>{hasSyncRes ? `${alignedVal.toFixed(3)} / 1.000` : 'N/A'}</strong>
+                      </div>
+                      <div className="sync-threshold-track">
+                        <div
+                          className={`sync-threshold-fill ${isCorrPass ? 'pass' : 'fail'}`}
+                          style={{ width: `${barPercent}%` }}
+                        ></div>
+                        <div
+                          className="sync-threshold-marker"
+                          style={{ left: `${effectiveThresholdVal * 100}%` }}
+                          title={`Effective Synchronization Threshold: ${effectiveThresholdVal.toFixed(2)}`}
+                        >
+                          <span className="sync-threshold-marker-tag">{effectiveThresholdVal.toFixed(2)}</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Recorded Lip Movement vs Audio Envelope Waveform Graph */}
+                    {renderSignalWaveformGraph(
+                      finalSummary.signalGraphPoints || [],
+                      Math.max((syncRes?.audioDurationMs || 5000) / 1000, 1.0),
+                      finalSummary.isBackendSignalSeries ? 'Backend-Aligned Signals' : 'Captured Signals'
+                    )}
+                  </div>
+                );
+              })()}
+
+              {/* Detailed Summary Statistics Grid */}
+              <div className="summary-stats-grid">
+                <div className="summary-stat-item">
+                  <span className="summary-stat-label">Language</span>
+                  <span className="summary-stat-value">
+                    {getLanguageMeta(finalSummary.language || finalSummary.backendSyncResult?.language || selectedLanguage).englishName}{' '}
+                    <small style={{ color: 'var(--color-text-muted)' }}>
+                      ({getLanguageMeta(finalSummary.language || finalSummary.backendSyncResult?.language || selectedLanguage).label})
+                    </small>
+                  </span>
+                </div>
+                <div className="summary-stat-item">
+                  <span className="summary-stat-label">Challenge Match</span>
+                  <span className={`summary-stat-value ${finalSummary.phraseVerificationStatus === 'PASS' ? 'text-success' : 'text-danger'}`}>
+                    {finalSummary.phraseVerificationStatus === 'PASS' ? 'Matched' : 'Mismatched'} ({finalSummary.overallScore ? finalSummary.overallScore.toFixed(1) : 0}%)
+                  </span>
+                </div>
+                <div className="summary-stat-item" style={{ gridColumn: 'span 2' }}>
+                  <span className="summary-stat-label">Challenge Phrase</span>
+                  <span className="summary-stat-value phrase-text-summary" style={{ maxWidth: '100%', whiteSpace: 'normal', color: '#2563EB' }}>
+                    "{finalSummary.expectedPhrase}"
+                  </span>
+                </div>
+                <div className="summary-stat-item" style={{ gridColumn: 'span 2' }}>
+                  <span className="summary-stat-label">Recognized Speech (Transcript)</span>
+                  <span className="summary-stat-value phrase-text-summary" style={{ maxWidth: '100%', whiteSpace: 'normal', color: finalSummary.phraseVerificationStatus === 'PASS' ? '#16A34A' : '#DC2626' }}>
+                    "{finalSummary.transcribedPhrase || finalSummary.recognizedText || 'No speech was recognized.'}"
+                  </span>
+                </div>
+                <div className="summary-stat-item">
+                  <span className="summary-stat-label">Liveness Result</span>
+                  <span className={`summary-stat-value ${finalResult === 'LIVE' ? 'text-success' : 'text-danger'}`}>
+                    {finalResult}
+                  </span>
+                </div>
+                <div className="summary-stat-item">
+                  <span className="summary-stat-label">Lip-Voice Sync Status</span>
+                  <span className={`summary-stat-value ${(finalSummary.backendSyncResult?.syncStatus === 'LIVE' || finalSummary.backendSyncResult?.isSyncValid) ? 'text-success' : 'text-danger'}`}>
+                    {finalSummary.backendSyncResult?.syncStatus || 'SPOOF'}
+                  </span>
+                </div>
+                <div className="summary-stat-item">
+                  <span className="summary-stat-label">Aligned Correlation</span>
+                  <span className="summary-stat-value">
+                    {finalSummary.backendSyncResult ? finalSummary.backendSyncResult.alignedCorrelation.toFixed(3) : finalSummary.averageScore.toFixed(3)}
+                    <small style={{ color: 'var(--color-text-muted)', marginLeft: '4px' }}>
+                      (min {Number(finalSummary.backendSyncResult?.effectiveThreshold ?? BACKEND_LIVE_SYNC_THRESHOLD).toFixed(2)})
+                    </small>
+                  </span>
+                </div>
+                <div className="summary-stat-item">
+                  <span className="summary-stat-label">Effective / Global Threshold</span>
+                  <span className="summary-stat-value">
+                    {Number(finalSummary.backendSyncResult?.effectiveThreshold ?? calibrationProfile?.effectiveThreshold ?? BACKEND_LIVE_SYNC_THRESHOLD).toFixed(2)}
+                    <small style={{ color: 'var(--color-text-muted)', marginLeft: '4px' }}>
+                      (Global: {Number(finalSummary.backendSyncResult?.globalThreshold ?? BACKEND_LIVE_SYNC_THRESHOLD).toFixed(2)})
+                    </small>
+                  </span>
+                </div>
+                <div className="summary-stat-item">
+                  <span className="summary-stat-label">Estimated Time Offset</span>
+                  <span className="summary-stat-value">
+                    {finalSummary.backendSyncResult?.detectedTimeOffsetMs !== undefined ? `${finalSummary.backendSyncResult.detectedTimeOffsetMs}ms` : '0ms'}
+                    <small style={{ color: 'var(--color-text-muted)', marginLeft: '4px' }}>(&lt; 500ms)</small>
+                  </span>
+                </div>
+                <div className="summary-stat-item">
+                  <span className="summary-stat-label">Audio / Lip Duration</span>
+                  <span className="summary-stat-value">
+                    {finalSummary.backendSyncResult ? `${(finalSummary.backendSyncResult.audioDurationMs / 1000).toFixed(2)}s / ${(finalSummary.backendSyncResult.lipDurationMs / 1000).toFixed(2)}s` : `${finalSummary.duration.toFixed(1)}s`}
+                  </span>
+                </div>
+                <div className="summary-stat-item">
+                  <span className="summary-stat-label">Duration Difference</span>
+                  <span className="summary-stat-value">
+                    {finalSummary.backendSyncResult?.durationDifferenceMs !== undefined ? `${finalSummary.backendSyncResult.durationDifferenceMs}ms` : '0ms'}
+                  </span>
+                </div>
+                <div className="summary-stat-item">
+                  <span className="summary-stat-label">Valid Sync Frames</span>
+                  <span className="summary-stat-value">{finalSummary.backendSyncResult?.validFrames ?? 0}</span>
+                </div>
+              </div>
+
+              {/* Action Buttons inside Summary */}
+              <div className="summary-actions">
+                <button
+                  className="btn-secondary"
+                  onClick={() => {
+                    setShowSummaryCard(false);
+                    setFinalSummary(null);
+                    setFinalResult('');
+                  }}
+                >
+                  Close
+                </button>
+                {!calibrationProfile?.isCalibrated && (isCalibrationMode || finalSummary.wasCalibrationAttempt) && (
+                  <button
+                    className="btn-primary"
+                    onClick={() => {
+                      setShowSummaryCard(false);
+                      setFinalSummary(null);
+                      handleContinueCalibration();
+                    }}
+                  >
+                    Record Sample {Math.min((calibrationProfile?.validSamplesCount || 0) + 1, calibrationProfile?.requiredSamples || DEFAULT_CALIBRATION_SAMPLES)} of {calibrationProfile?.requiredSamples || DEFAULT_CALIBRATION_SAMPLES}
+                  </button>
+                )}
+                <button 
+                  className="btn-primary"
+                  onClick={() => {
+                    setIsCalibrationMode(false);
+                    isCalibrationModeRef.current = false;
+                    setShowSummaryCard(false);
+                    setFinalSummary(null);
+                    startCamera();
+                  }}
+                >
+                  Start New Authentication
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* CASE B: When Camera is Active (Show Challenge & Sync Monitor) */}
+          {status === 'active' && challengePhrase && (
+            <div className="challenge-card">
+              <div className="challenge-card-header">
+                <span className="challenge-icon">{isCalibrationMode ? '🎯' : '🔐'}</span>
+                <div className="challenge-title-group">
+                  <h3 className="challenge-card-title">
+                    {isCalibrationMode
+                      ? `Calibration Recording — Sample ${Math.min((calibrationProfile?.validSamplesCount || 0) + 1, calibrationProfile?.requiredSamples || DEFAULT_CALIBRATION_SAMPLES)} of ${calibrationProfile?.requiredSamples || DEFAULT_CALIBRATION_SAMPLES}`
+                      : `Speech Challenge (${getLanguageMeta(selectedLanguage).label})`}
+                  </h3>
+                </div>
+                <span className={`challenge-status-badge status-${challengeStatus.toLowerCase()}`}>
+                  {challengeStatus}
+                </span>
+              </div>
+
+              <div className="challenge-phrase-box">
+                <div className="challenge-phrase-label">
+                  Speak the {getLanguageMeta(selectedLanguage).englishName} phrase clearly:
+                </div>
+                <div className={`challenge-phrase-text ${challengeStatus === 'RECORDING' ? 'recording' : ''}`}>
+                  "{displayedChallenge}"
+                </div>
+              </div>
+
+              <div className="challenge-timer-section">
+                {challengeStatus !== 'RECORDING' && challengeStatus !== 'COMPLETED' ? (
+                  <>
+                    <div className="timer-info">
+                      <span className="timer-text">Phrase expires in: <strong>{challengeTimeLeft}s</strong></span>
+                    </div>
+                    <div className="timer-progress-container">
+                      <div 
+                        className="timer-progress-bar" 
+                        style={{ width: `${(challengeTimeLeft / 30) * 100}%` }}
+                      ></div>
+                    </div>
+                  </>
+                ) : challengeStatus === 'RECORDING' ? (
+                  <div className="recording-indicator">
+                    <span className="recording-dot pulse"></span>
+                    <span>Recording in progress... Keep speaking clearly</span>
+                  </div>
+                ) : (
+                  <div className="completed-indicator">
+                    <span className="completed-icon">✅</span>
+                    <span>Recording captured. Verifying multimodal signals...</span>
+                  </div>
+                )}
+              </div>
+
+              <div className="challenge-controls">
+                {challengeStatus === 'RECORDING' ? (
+                  <>
+                    <div className="recording-duration">
+                      Recording: <strong>{recordingTime}s / 5s</strong> (Target: 5 seconds)
+                    </div>
+                    <div className="timer-progress-container" style={{ width: '100%', marginBottom: '4px' }}>
+                      <div 
+                        className="timer-progress-bar" 
+                        style={{ 
+                          width: `${Math.min((recordingTime / 5) * 100, 100)}%`,
+                          background: 'linear-gradient(90deg, #ef4444, #f59e0b)'
+                        }}
+                      ></div>
+                    </div>
+                    <button
+                      className="btn-stop-record"
+                      onClick={stopRecording}
+                    >
+                      Stop Recording &amp; Verify
+                    </button>
+                  </>
+                ) : (
+                  <button 
+                    className="btn-start-record" 
+                    disabled={!faceDetected || (phraseVerificationStatus && phraseVerificationStatus !== '')}
+                    title={phraseVerificationStatus ? "Verification completed" : !faceDetected ? "Position face in camera to record" : "Start Recording"}
+                    onClick={startRecording}
+                  >
+                    {isCalibrationMode
+                      ? `Record Calibration Sample ${Math.min((calibrationProfile?.validSamplesCount || 0) + 1, calibrationProfile?.requiredSamples || DEFAULT_CALIBRATION_SAMPLES)} of ${calibrationProfile?.requiredSamples || DEFAULT_CALIBRATION_SAMPLES} (5s)`
+                      : 'Start Recording (5s)'}
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Real-time Lip-Voice Synchronization & Signal Waveform Monitor (When Active) */}
+          {status === 'active' && (() => {
+            const isAdaptiveActive = Boolean(!isCalibrationMode && calibrationProfile?.isCalibrated);
+            const activeEffThreshold = isCalibrationMode
+              ? BACKEND_LIVE_SYNC_THRESHOLD
+              : Number(calibrationProfile?.effectiveThreshold ?? BACKEND_LIVE_SYNC_THRESHOLD);
+            return (
+              <div className="metrics-dashboard sync-live-monitor">
+                <div className="metrics-header">
+                  <h3>📈 Lip-Voice Synchronization Monitor</h3>
+                  <span className={`metrics-status-badge ${challengeStatus === 'RECORDING' ? 'recording-badge' : 'active'}`}>
+                    {isCalibrationMode
+                      ? `Calibration Sample ${Math.min((calibrationProfile?.validSamplesCount || 0) + 1, calibrationProfile?.requiredSamples || DEFAULT_CALIBRATION_SAMPLES)} of ${calibrationProfile?.requiredSamples || DEFAULT_CALIBRATION_SAMPLES}`
+                      : (isAdaptiveActive ? 'Adaptive threshold active' : 'Global threshold active')}
+                  </span>
+                </div>
+
+                <div className="sync-analysis-panel">
+                  <div className="sync-Key-metrics-row">
+                    <div className="sync-key-card">
+                      <span className="sync-key-label">Sync Score</span>
+                      <span className="sync-key-value text-muted-live">
+                        {phraseVerificationLoading ? 'Computing...' : 'Pending 5s Capture'}
+                      </span>
+                      <span className="sync-key-sub">
+                        Threshold &ge; {activeEffThreshold.toFixed(2)} ({isAdaptiveActive ? 'Adaptive' : 'Global'})
+                      </span>
+                    </div>
+
+                    <div className="sync-key-card">
+                      <span className="sync-key-label">Time Offset</span>
+                      <span className="sync-key-value text-muted-live">
+                        {phraseVerificationLoading ? 'Aligning...' : 'Pending 5s Capture'}
+                      </span>
+                      <span className="sync-key-sub">
+                        Max allowed: &plusmn;{BACKEND_MAX_SYNC_OFFSET_MS} ms
+                      </span>
+                    </div>
+
+                    <div className="sync-key-card">
+                      <span className="sync-key-label">Sync Status</span>
+                      <span className={`sync-key-value ${challengeStatus === 'RECORDING' ? 'text-recording-live' : 'text-muted-live'}`}>
+                        {challengeStatus === 'RECORDING' ? 'Sampling Signals...' : 'Awaiting Recording'}
+                      </span>
+                      <span className="sync-key-sub">
+                        Verdict after verification
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Visual Synchronization Threshold Reference Bar */}
+                  <div className="sync-threshold-bar-box">
+                    <div className="sync-threshold-bar-labels">
+                      <span>
+                        {isAdaptiveActive
+                          ? `Active Adaptive Threshold (${activeEffThreshold.toFixed(2)} vs Global ${BACKEND_LIVE_SYNC_THRESHOLD.toFixed(2)})`
+                          : `Required Synchronization Threshold (${activeEffThreshold.toFixed(2)})`}
+                      </span>
+                      <strong>Target &ge; {activeEffThreshold.toFixed(2)}</strong>
+                    </div>
+                    <div className="sync-threshold-track">
+                      <div
+                        className="sync-threshold-marker"
+                        style={{ left: `${activeEffThreshold * 100}%` }}
+                        title={`Active Effective Threshold: ${activeEffThreshold.toFixed(2)}`}
+                      >
+                        <span className="sync-threshold-marker-tag">{activeEffThreshold.toFixed(2)}</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Live Normalized Lip Movement vs Audio Energy Graph */}
+                  {renderSignalWaveformGraph(
+                    liveGraphPoints,
+                    5.0,
+                    challengeStatus === 'RECORDING' ? 'Recording 5s Window (Live)' : 'Rolling 5s Preview (Live)'
+                  )}
+                </div>
+              </div>
+            );
+          })()}
+
+          {/* CASE C: Verification Guide Card (When Camera is Standby and Summary is Not Open) */}
+          {status === 'off' && !showSummaryCard && (
+            <div className="verification-guide-card">
+              <div className="guide-card-header">
+                <span className="guide-icon">🛡️</span>
+                <div>
+                  <h3 className="guide-title">Multimodal Liveness Verification</h3>
+                  <p className="guide-subtitle">Authenticate presence in three steps</p>
+                </div>
+              </div>
+              <div className="guide-steps-list">
+                <div className="guide-step-item">
+                  <span className="guide-step-num">1</span>
+                  <div className="guide-step-content">
+                    <strong>Select Challenge Language</strong>
+                    <p>Choose English, Hindi, or other supported languages from the bar above.</p>
+                  </div>
+                </div>
+                <div className="guide-step-item">
+                  <span className="guide-step-num">2</span>
+                  <div className="guide-step-content">
+                    <strong>Initialize Authentication</strong>
+                    <p>Click "Start Authentication" on the left to activate your camera and microphone.</p>
+                  </div>
+                </div>
+                <div className="guide-step-item">
+                  <span className="guide-step-num">3</span>
+                  <div className="guide-step-content">
+                    <strong>Speak Challenge Phrase</strong>
+                    <p>Record for 5 seconds while reading the randomly generated phrase. MediaPipe and Whisper verify lip-voice synchrony.</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Adaptive Per-User Synchronization Threshold Calibration Card */}
+          <div className="calibration-card">
+            <div className="calibration-card-header">
+              <div className="calibration-title-group">
+                <span className="calibration-title">🎯 Adaptive Per-User Calibration</span>
+                <span
+                  className={`calibration-status-pill ${
+                    calibrationProfile?.isCalibrated
+                      ? 'calibrated'
+                      : calibrationProfile?.calibrationStatus === 'IN_PROGRESS'
+                      ? 'in-progress'
+                      : 'not-calibrated'
+                  }`}
+                >
+                  {calibrationProfile?.isCalibrated
+                    ? `Calibrated (${calibrationProfile.validSamplesCount}/${calibrationProfile.requiredSamples || DEFAULT_CALIBRATION_SAMPLES})`
+                    : calibrationProfile?.calibrationStatus === 'IN_PROGRESS'
+                    ? `In Progress (${Math.min((calibrationProfile?.validSamplesCount || 0) + 1, calibrationProfile?.requiredSamples || DEFAULT_CALIBRATION_SAMPLES)} of ${calibrationProfile?.requiredSamples || DEFAULT_CALIBRATION_SAMPLES})`
+                    : 'Not Calibrated'}
+                </span>
+              </div>
+
+              <div className="calibration-active-mode-indicator">
+                <span
+                  className={`threshold-mode-pill ${
+                    calibrationProfile?.isCalibrated ? 'adaptive-active' : 'global-active'
+                  }`}
+                >
+                  {calibrationProfile?.isCalibrated
+                    ? '⚡ Adaptive threshold active'
+                    : '🌐 Global threshold active'}
+                </span>
               </div>
             </div>
 
-            <div className="metric-card">
-              <span className="metric-label">Horizontal Distance</span>
-              <div className="metric-value-container">
-                <span className="metric-value">{metrics.horizontalDistance.toFixed(4)}</span>
-                <span className="metric-unit">norm</span>
-              </div>
-              <div className="metric-bar-container">
-                <div 
-                  className="metric-bar horizontal-bar" 
-                  style={{ width: `${Math.min(metrics.horizontalDistance * 600, 100)}%` }}
-                ></div>
-              </div>
-            </div>
-
-            <div className="metric-card highlighted-card">
-              <span className="metric-label">Lip Opening Ratio</span>
-              <div className="metric-value-container">
-                <span className="metric-value highlighted-value">{metrics.lipOpeningRatio.toFixed(3)}</span>
-                <span className="metric-unit">V/H</span>
-              </div>
-              <div className="metric-bar-container ratio-bar-container">
-                <div 
-                  className="metric-bar ratio-bar" 
-                  style={{ width: `${Math.min(metrics.lipOpeningRatio * 150, 100)}%` }}
-                ></div>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Real-time Audio Capture Metrics Dashboard */}
-      {status === 'active' && (
-        <div className="metrics-dashboard audio-dashboard">
-          <div className="metrics-header">
-            <h3>🎙️ Audio Capture Metrics</h3>
-            <span className={`metrics-status-badge mic-${micStatus}`}>
-              {micStatus === 'active' && 'Microphone Active'}
-              {micStatus === 'requesting' && 'Requesting Mic...'}
-              {micStatus === 'denied' && 'Mic Permission Denied'}
-              {micStatus === 'unavailable' && 'Mic Device Not Found'}
-              {micStatus === 'off' && 'Microphone Off'}
-            </span>
-          </div>
-
-          <div className="metrics-grid mic-grid">
-            <div className="metric-card">
-              <span className="metric-label">Audio Energy</span>
-              <div className="metric-value-container">
-                <span className="metric-value">{audioEnergy.toFixed(4)}</span>
-                <span className="metric-unit">RMS</span>
-              </div>
-            </div>
-
-            <div className="metric-card">
-              <span className="metric-label">Audio Buffer Size</span>
-              <div className="metric-value-container">
-                <span className="metric-value">{audioBufferRef.current.length}</span>
-                <span className="metric-unit">frames</span>
-              </div>
-            </div>
-
-            <div className="metric-card highlighted-card mic-energy-card">
-              <span className="metric-label">Live Volume Meter</span>
-              <div className="metric-value-container">
-                <span className="metric-value highlighted-value mic-energy-value">{Math.round(audioEnergy * 100)}%</span>
-              </div>
-              <div className="metric-bar-container mic-energy-bar-container">
-                <div 
-                  className="metric-bar mic-energy-bar" 
-                  style={{ width: `${audioEnergy * 100}%` }}
-                ></div>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Day 16: Lip-Voice Synchronization Engine Dashboard */}
-      {false && status === 'active' && (
-        <div className="metrics-dashboard sync-dashboard">
-          <div className="metrics-header">
-            <h3>🔗 Lip-Voice Synchronization</h3>
-            <span className={`sync-status-badge status-${syncStatus.toLowerCase()}`}>
-              {syncStatus === 'PENDING' 
-                ? `PENDING (${syncSamplesCount}/${MIN_SYNC_SAMPLES})` 
-                : syncStatus}
-            </span>
-          </div>
-
-          <div className="sync-grid">
-            <div className="metric-card sync-score-card">
-              <span className="metric-label">Smoothed Correlation</span>
-              <div className="metric-value-container">
-                <span className="metric-value sync-score-value">{syncScore.toFixed(3)}</span>
-                <span className="metric-unit">Pearson r</span>
-              </div>
-              <div className="threshold-indicator">
-                Threshold: {syncThreshold.toFixed(2)}
-              </div>
-            </div>
-
-            <div className="metric-card sync-raw-score-card">
-              <span className="metric-label">Raw Correlation</span>
-              <div className="metric-value-container">
-                <span className="metric-value">{rawSyncScore.toFixed(3)}</span>
-                <span className="metric-unit">Pearson r</span>
-              </div>
-            </div>
-
-            <div className="metric-card sync-confidence-card">
-              <span className="metric-label">Synchronization Confidence</span>
-              <div className="metric-value-container">
-                <span className="metric-value highlighted-value sync-confidence-value">{syncConfidence.toFixed(1)}%</span>
-              </div>
-              <div className="metric-bar-container sync-confidence-bar-container">
-                <div 
-                  className={`metric-bar sync-confidence-bar status-${syncStatus.toLowerCase()}`}
-                  style={{ width: `${syncConfidence}%` }}
-                ></div>
-              </div>
-            </div>
-          </div>
-
-          {/* Threshold Configuration Slider */}
-          <div className="sync-settings">
-            <div className="settings-header">
-              <label htmlFor="threshold-slider" className="settings-label">
-                Authentication Threshold: <span className="threshold-val">{syncThreshold.toFixed(2)}</span>
+            {/* User Profile Row */}
+            <div className="calibration-user-row">
+              <label className="calibration-user-label" htmlFor="calibration-user-id-input">
+                User Profile ID:
               </label>
+              <input
+                id="calibration-user-id-input"
+                type="text"
+                className="calibration-user-input"
+                value={userId}
+                disabled={isRecording || phraseVerificationLoading}
+                onChange={(e) => setUserId(e.target.value || 'user-default')}
+                placeholder="user-default"
+              />
+              <span className="calibration-progress-text">
+                {calibrationProfile?.isCalibrated
+                  ? `Calibration: Complete (${calibrationProfile.validSamplesCount}/${calibrationProfile.requiredSamples || DEFAULT_CALIBRATION_SAMPLES} samples)`
+                  : `Progress: ${calibrationProfile?.validSamplesCount || 0} of ${calibrationProfile?.requiredSamples || DEFAULT_CALIBRATION_SAMPLES} valid samples`}
+              </span>
             </div>
-            <input 
-              id="threshold-slider"
-              type="range"
-              min="0.10"
-              max="0.95"
-              step="0.05"
-              value={syncThreshold}
-              onChange={(e) => setSyncThreshold(parseFloat(e.target.value))}
-              className="threshold-slider"
-            />
-          </div>
 
-          {/* Project Diagnostics Panel */}
-          <div className="sync-diagnostics">
-            <div className="diagnostics-title">📊 Synchronization Diagnostics</div>
-            <div className="diagnostics-grid">
-              <div className="diagnostic-item">
-                <span className="diag-label">Lip Samples:</span>
-                <span className="diag-value">{diagnostics.lipSamples}</span>
+            {/* Threshold Values Grid */}
+            <div className="calibration-thresholds-grid">
+              <div className="calibration-threshold-box">
+                <span className="cal-thresh-label">Global Threshold</span>
+                <span className="cal-thresh-val">
+                  {Number(calibrationProfile?.globalThreshold ?? BACKEND_LIVE_SYNC_THRESHOLD).toFixed(2)}
+                </span>
+                <span className="cal-thresh-sub">Minimum safety floor</span>
               </div>
-              <div className="diagnostic-item">
-                <span className="diag-label">Audio Samples:</span>
-                <span className="diag-value">{diagnostics.audioSamples}</span>
+              <div className="calibration-threshold-box">
+                <span className="cal-thresh-label">Adaptive Threshold</span>
+                <span className="cal-thresh-val highlight-adaptive">
+                  {calibrationProfile?.adaptiveThreshold !== null && calibrationProfile?.adaptiveThreshold !== undefined
+                    ? Number(calibrationProfile.adaptiveThreshold).toFixed(2)
+                    : '—'}
+                </span>
+                <span className="cal-thresh-sub">
+                  {calibrationProfile?.meanScore !== null && calibrationProfile?.meanScore !== undefined
+                    ? `μ=${Number(calibrationProfile.meanScore).toFixed(2)}, σ=${Number(calibrationProfile.stdDeviation || 0).toFixed(3)}`
+                    : 'Requires 3 samples'}
+                </span>
               </div>
-              <div className="diagnostic-item">
-                <span className="diag-label">Aligned Samples:</span>
-                <span className="diag-value">{diagnostics.alignedSamples}</span>
-              </div>
-              <div className="diagnostic-item">
-                <span className="diag-label">Sync Window:</span>
-                <span className="diag-value">{diagnostics.syncWindow.toFixed(2)}s</span>
+              <div className="calibration-threshold-box effective-box">
+                <span className="cal-thresh-label">Effective Threshold</span>
+                <span className="cal-thresh-val highlight-effective">
+                  {Number(calibrationProfile?.effectiveThreshold ?? BACKEND_LIVE_SYNC_THRESHOLD).toFixed(2)}
+                </span>
+                <span className="cal-thresh-sub">
+                  {calibrationProfile?.isCalibrated ? 'Personalized ≥ 0.45' : 'Global fallback (0.45)'}
+                </span>
               </div>
             </div>
-          </div>
-        </div>
-      )}
 
-      {/* 3. Action Controls */}
-      <div className="action-section" style={{ width: '100%' }}>
-        {status === 'active' || status === 'requesting' || ['denied', 'unavailable', 'unsupported'].includes(status) ? (
-          <button className="btn-danger" onClick={stopCamera}>
-            Stop Camera
-          </button>
-        ) : (
-          <button className="btn-primary" onClick={startCamera}>
-            Start Authentication
-          </button>
-        )}
-        
-        {/* Informative Notes */}
-        <div className="info-notes">
-          <div className="info-item">
-            <span className="info-icon">📹</span>
-            <span className="info-text">Requires camera permission for mouth tracking</span>
-          </div>
-          <div className="info-item">
-            <span className="info-icon">🎙️</span>
-            <span className="info-text">Requires microphone access for voice sync check</span>
+            {/* Accepted Calibration Sample Scores */}
+            <div className="calibration-samples-row">
+              <span className="calibration-samples-label">Accepted Samples:</span>
+              {Array.isArray(calibrationProfile?.validScores) && calibrationProfile.validScores.length > 0 ? (
+                <div className="calibration-samples-list">
+                  {calibrationProfile.validScores.map((score, idx) => (
+                    <span key={`cal-sample-${idx}`} className="calibration-sample-chip">
+                      Sample {idx + 1}: <strong>{Number(score).toFixed(2)}</strong>
+                    </span>
+                  ))}
+                </div>
+              ) : (
+                <span className="calibration-samples-empty">
+                  No calibration samples yet (requires LIVE pass ≥ 0.45 and |offset| ≤ 500 ms).
+                </span>
+              )}
+            </div>
+
+            {/* Last Calibration Sample Feedback */}
+            {lastCalibrationOutcome && (
+              <div
+                className={`calibration-outcome-banner ${
+                  lastCalibrationOutcome.sampleAccepted ? 'accepted' : 'rejected'
+                }`}
+              >
+                {lastCalibrationOutcome.sampleAccepted ? (
+                  <span>
+                    ✅ Sample {lastCalibrationOutcome.currentSampleNumber} of {lastCalibrationOutcome.requiredSamples} accepted (Aligned Sync Score:{' '}
+                    <strong>{Number(lastCalibrationOutcome.alignedCorrelation).toFixed(2)}</strong>)
+                  </span>
+                ) : (
+                  <span>
+                    ⚠️ Calibration sample rejected — excluded from baseline:{' '}
+                    <strong>{lastCalibrationOutcome.sampleRejectionReason}</strong>
+                  </span>
+                )}
+              </div>
+            )}
+
+            {/* Calibration Controls */}
+            <div className="calibration-actions-row">
+              <button
+                type="button"
+                className="btn-calibration-start"
+                disabled={isRecording || phraseVerificationLoading}
+                onClick={handleStartNewCalibration}
+              >
+                {calibrationProfile?.isCalibrated || (calibrationProfile?.validSamplesCount || 0) > 0
+                  ? '🔄 Reset & Start New Calibration (3 Samples)'
+                  : '🎯 Start Calibration (3 Samples)'}
+              </button>
+
+              {!calibrationProfile?.isCalibrated && (calibrationProfile?.validSamplesCount || 0) > 0 && (
+                <button
+                  type="button"
+                  className="btn-calibration-continue"
+                  disabled={isRecording || phraseVerificationLoading}
+                  onClick={handleContinueCalibration}
+                >
+                  ▶️ Record Sample {(calibrationProfile?.validSamplesCount || 0) + 1} of{' '}
+                  {calibrationProfile?.requiredSamples || DEFAULT_CALIBRATION_SAMPLES}
+                </button>
+              )}
+
+              {isCalibrationMode && (
+                <button
+                  type="button"
+                  className="btn-calibration-exit"
+                  disabled={isRecording || phraseVerificationLoading}
+                  onClick={() => {
+                    setIsCalibrationMode(false);
+                    isCalibrationModeRef.current = false;
+                  }}
+                >
+                  Switch to Standard Verification
+                </button>
+              )}
+            </div>
           </div>
         </div>
       </div>

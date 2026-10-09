@@ -5,6 +5,7 @@ import numpy as np
 import soundfile as sf
 from typing import Dict, Any
 from backend.config import settings
+from backend.services.lip_service import lip_service
 
 class AudioProcessingError(Exception):
     """Exception raised when audio processing or conversion fails."""
@@ -142,11 +143,23 @@ class SyncService:
                     
         return float(raw_corr), float(best_corr), best_lag
 
-    def calculate_sync_metrics(self, lip_movement: list, lip_timestamps: list, audio_filepath: str) -> Dict[str, Any]:
+    def calculate_sync_metrics(
+        self,
+        lip_movement: list,
+        lip_timestamps: list,
+        audio_filepath: str,
+        correlation_threshold: float = None
+    ) -> Dict[str, Any]:
         """
         Runs the full Lip-Voice Synchronization pipeline and computes diagnostic metrics.
         Converts the source audio to WAV first.
         """
+        global_threshold = float(settings.LIVE_SYNC_THRESHOLD)
+        if correlation_threshold is not None:
+            effective_threshold = max(float(correlation_threshold), global_threshold)
+        else:
+            effective_threshold = global_threshold
+
         temp_wav = None
         try:
             # 1. Create a thread-safe temporary file for WAV output
@@ -197,7 +210,42 @@ class SyncService:
             ignored_frames = len(lip_movement) - valid_frames
             avg_energy = float(np.mean(audio_envelope)) if len(audio_envelope) > 0 else 0.0
 
-            # 8. Check minimal frame threshold
+            # Prepare time-aligned normalized signal series for frontend visualization
+            t0 = float(lip_timestamps[0]) if len(lip_timestamps) > 0 else 0.0
+            rel_timestamps = [round(float(t - t0), 1) for t in lip_timestamps]
+            display_audio = norm_audio if valid_frames > 0 else np.clip(audio_envelope, 0.0, 1.0)
+            signal_series = {
+                "timestampsMs": rel_timestamps,
+                "normalizedLip": [round(float(v), 4) for v in norm_lip],
+                "normalizedAudio": [round(float(v), 4) for v in display_audio]
+            }
+
+            # 8. Validate visual lip movement dynamics via LipService
+            is_lip_moving, lip_variance = lip_service.verify_lip_movement(lip_movement)
+            if not is_lip_moving:
+                return {
+                    "audioDurationMs": audio_duration_ms,
+                    "rawCorrelation": 0.0,
+                    "alignedCorrelation": 0.0,
+                    "detectedTimeOffsetMs": 0.0,
+                    "validFrames": valid_frames,
+                    "ignoredFrames": ignored_frames,
+                    "averageAudioEnergy": avg_energy,
+                    "lipVariance": round(lip_variance, 6),
+                    "isLipMoving": False,
+                    "syncStatus": "SPOOF",
+                    "syncReason": (
+                        f"Insufficient or static lip movement detected (variance: {lip_variance:.6f} < "
+                        f"{settings.MIN_LIP_VARIATION}). Physical lip movement is required."
+                    ),
+                    "isSynchronized": False,
+                    "globalThreshold": round(global_threshold, 4),
+                    "effectiveThreshold": round(effective_threshold, 4),
+                    "maxAllowedOffsetMs": settings.MAX_SYNC_TIME_DIFF_MS,
+                    "signalSeries": signal_series
+                }
+
+            # 9. Check minimal frame threshold
             if valid_frames < settings.MIN_VALID_SYNC_FRAMES:
                 return {
                     "audioDurationMs": audio_duration_ms,
@@ -207,15 +255,24 @@ class SyncService:
                     "validFrames": valid_frames,
                     "ignoredFrames": ignored_frames,
                     "averageAudioEnergy": avg_energy,
-                    "syncStatus": "PENDING"
+                    "lipVariance": round(lip_variance, 6),
+                    "isLipMoving": True,
+                    "syncStatus": "SPOOF",
+                    "syncReason": f"Insufficient speech audio frames ({valid_frames}/{settings.MIN_VALID_SYNC_FRAMES} required).",
+                    "isSynchronized": False,
+                    "globalThreshold": round(global_threshold, 4),
+                    "effectiveThreshold": round(effective_threshold, 4),
+                    "maxAllowedOffsetMs": settings.MAX_SYNC_TIME_DIFF_MS,
+                    "signalSeries": signal_series
                 }
 
             # Calculate average visual sampling time difference (avg FPS interval)
             deltas = np.diff(lip_timestamps)
             avg_dt = float(np.mean(deltas)) if len(deltas) > 0 else 33.33
 
-            # 9. Cross-correlation with lag
-            max_lag_indices = int(round(settings.SYNC_MAX_LAG_MS / avg_dt))
+            # 10. Cross-correlation with lag (search window up to 2x MAX_SYNC_TIME_DIFF_MS so offsets > 500ms can be detected)
+            search_lag_ms = max(settings.SYNC_MAX_LAG_MS * 2, int(settings.MAX_SYNC_TIME_DIFF_MS * 2))
+            max_lag_indices = int(round(search_lag_ms / avg_dt))
             max_lag_indices = max(1, max_lag_indices)
 
             raw_corr, aligned_corr, best_lag = self.cross_correlation_with_lag(
@@ -224,19 +281,50 @@ class SyncService:
 
             # Map lag to time offset in milliseconds
             time_offset_ms = float(best_lag * avg_dt)
+            abs_time_diff_ms = abs(time_offset_ms)
 
-            # 10. Classification status
-            status = "LIVE" if aligned_corr >= settings.LIVE_SYNC_THRESHOLD else "SPOOF"
+            # 11. Classification status:
+            # Rule: If aligned correlation < effective_threshold (which is >= LIVE_SYNC_THRESHOLD = 0.45) -> reject as SPOOF
+            # Rule: If visual-audio synchronization difference > MAX_SYNC_TIME_DIFF_MS (500 ms) -> reject as SPOOF
+            if aligned_corr < effective_threshold:
+                status = "SPOOF"
+                sync_reason = (
+                    f"Lip-voice cross-correlation ({aligned_corr:.2f}) is below "
+                    f"the required threshold ({effective_threshold:.2f})."
+                )
+                is_sync = False
+            elif abs_time_diff_ms > settings.MAX_SYNC_TIME_DIFF_MS:
+                status = "SPOOF"
+                sync_reason = (
+                    f"Visual-audio synchronization difference ({abs_time_diff_ms:.1f}ms) "
+                    f"exceeds the maximum allowed threshold ({settings.MAX_SYNC_TIME_DIFF_MS:.0f}ms)."
+                )
+                is_sync = False
+            else:
+                status = "LIVE"
+                sync_reason = (
+                    f"Lip-voice movement synchronized (correlation: {aligned_corr:.2f}, "
+                    f"offset: {time_offset_ms:+.1f}ms)."
+                )
+                is_sync = True
 
             return {
                 "audioDurationMs": audio_duration_ms,
                 "rawCorrelation": raw_corr,
                 "alignedCorrelation": aligned_corr,
-                "detectedTimeOffsetMs": time_offset_ms,
+                "detectedTimeOffsetMs": round(time_offset_ms, 2),
                 "validFrames": valid_frames,
                 "ignoredFrames": ignored_frames,
                 "averageAudioEnergy": avg_energy,
-                "syncStatus": status
+                "lipVariance": round(lip_variance, 6),
+                "isLipMoving": True,
+                "syncStatus": status,
+                "syncReason": sync_reason,
+                "isSynchronized": is_sync,
+                "globalThreshold": round(global_threshold, 4),
+                "effectiveThreshold": round(effective_threshold, 4),
+                "maxAllowedOffsetMs": settings.MAX_SYNC_TIME_DIFF_MS,
+                "signalSeries": signal_series
             }
 
         finally:

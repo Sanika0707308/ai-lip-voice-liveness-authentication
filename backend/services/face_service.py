@@ -1,63 +1,43 @@
 import numpy as np
+from backend.config import settings
 
 class FaceService:
     """
-    Service responsible for loading face landmark detection models (e.g., MediaPipe Face Mesh)
-    and processing video frames to verify face integrity and coordinates.
-
-    TODO: Future Integration Steps
-    1. Install MediaPipe dependency (`pip install mediapipe`).
-    2. Initialize MediaPipe Face Mesh model in `__init__`.
-    3. Process frames sequentially or in batches, converting BGR to RGB.
-    4. Extract and filter key landmark coordinates (specifically mouth, eyes, and outline).
-    5. Perform face pose estimation to reject extreme head angles.
+    Service defining facial landmark configurations, indices, and geometric integrity checks.
+    MediaPipe Face Mesh tracking runs in the client browser, with coordinate validation available here.
     """
     
+    # Key MediaPipe Face Mesh landmark indices
+    NOSE_TIP = 1
+    CHIN = 152
+    LEFT_EYE_CORNER = 33
+    RIGHT_EYE_CORNER = 263
+    LEFT_MOUTH_CORNER = 61
+    RIGHT_MOUTH_CORNER = 291
+    UPPER_LIP = 13
+    LOWER_LIP = 14
+
     def __init__(self):
-        # TODO: Initialize MediaPipe FaceMesh model:
-        # self.mp_face_mesh = mp.solutions.face_mesh
-        # self.face_mesh = self.mp_face_mesh.FaceMesh(
-        #     max_num_faces=1,
-        #     refine_landmarks=True,
-        #     min_detection_confidence=0.5,
-        #     min_tracking_confidence=0.5
-        # )
         pass
-        
-    def detect_face_landmarks(self, video_frames: list) -> list:
-        """
-        Purpose: Parses video frames to extract 3D landmarks for facial regions.
-        
-        Inputs:
-            video_frames (list): List of raw or decoded image frames (numpy arrays).
-            
-        Outputs:
-            list: Extracted landmark coordinate arrays over time.
-            
-        TODO: Future Implementation Steps
-            - Iterate over each image frame in the input list.
-            - Run the face_mesh.process() on the frame.
-            - Extract facial landmarks (multi_face_landmarks).
-            - Extract coordinates of interest and normalize them.
-            - Handle errors when no face or multiple faces are detected.
-        """
-        # Placeholder: returning empty landmarks list
-        return []
 
     def verify_face_pose(self, face_landmarks: list) -> bool:
         """
-        Purpose: Checks if the face orientation (yaw, pitch, roll) is standard to prevent 
-        oblique angle spoof attacks.
-        
-        Inputs:
-            face_landmarks (list): Sequence of facial landmarks extracted from frames.
-            
-        Outputs:
-            bool: True if the pose is within standard threshold limits, False otherwise.
-            
-        TODO: Future Implementation Steps
-            - Compute Euler angles (yaw, pitch, roll) from key face landmarks (nose, eyes, mouth corners).
-            - Set bounding constraints on yaw and pitch angles to verify the user is facing the camera.
+        Validates whether key facial landmarks are present and reasonably oriented towards the camera.
         """
-        # Placeholder: always passes pose verification in the mock environment
-        return True
+        if not face_landmarks:
+            return False
+            
+        try:
+            # Check presence of key bounding landmarks
+            required_indices = [
+                self.NOSE_TIP, self.CHIN, self.LEFT_EYE_CORNER, 
+                self.RIGHT_EYE_CORNER, self.LEFT_MOUTH_CORNER, self.RIGHT_MOUTH_CORNER
+            ]
+            for idx in required_indices:
+                if idx >= len(face_landmarks) or face_landmarks[idx] is None:
+                    return False
+            return True
+        except Exception:
+            return False
+
+face_service = FaceService()

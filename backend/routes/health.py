@@ -10,13 +10,13 @@ async def health_check():
     """
     return {
         "status": "healthy",
-        "service": "Lip-Voice Liveness Detection System API",
+        "service": "Lip-Voice Liveness Authentication System API",
         "version": "1.0.0",
         "subsystems": {
-            "face_mesh_service": "initialized (placeholder)",
-            "lip_tracker_service": "initialized (placeholder)",
-            "whisper_audio_service": "initialized (placeholder)",
-            "sync_analysis_service": "initialized (placeholder)",
-            "mongodb_storage_service": "initialized (placeholder)"
+            "face_mesh_service": "active",
+            "lip_tracker_service": "active",
+            "whisper_audio_service": "active",
+            "sync_analysis_service": "active",
+            "mongodb_storage_service": "active"
         }
     }

@@ -14,6 +14,7 @@ if str(root_dir) not in sys.path:
 
 from backend.app import app
 from backend.config import settings
+from backend.services.verification_service import VerificationEngine
 
 client = TestClient(app)
 
@@ -307,6 +308,69 @@ def run_tests():
     finally:
         if os.path.exists(temp_txt.name):
             os.remove(temp_txt.name)
+
+    # SCENARIO 10: DEBUG=True allows test-session speech verification bypass
+    orig_debug = settings.DEBUG
+    try:
+        settings.DEBUG = True
+        v_res = VerificationEngine.verify(
+            session_id="test-session-debug-allow",
+            expected_phrase="test phrase",
+            recognized_text="",
+            whisper_confidence=0.0
+        )
+        assert v_res["verificationStatus"] == "PASS", f"Expected PASS in DEBUG=True, got {v_res['verificationStatus']}"
+        assert v_res["verificationReason"] == "Test session bypass"
+        print("[PASS] Scenario 10 (DEBUG=True allows test-session bypass)")
+    except Exception as e:
+        print(f"[FAIL] Scenario 10 (DEBUG=True allows test-session bypass): {str(e)}")
+        all_passed = False
+    finally:
+        settings.DEBUG = orig_debug
+
+    # SCENARIO 11: DEBUG=False blocks test-session speech verification bypass
+    orig_debug = settings.DEBUG
+    try:
+        settings.DEBUG = False
+        v_res = VerificationEngine.verify(
+            session_id="test-session-debug-blocked",
+            expected_phrase="test phrase",
+            recognized_text="",
+            whisper_confidence=0.0
+        )
+        assert v_res["verificationStatus"] == "FAIL", f"Expected FAIL in DEBUG=False, got {v_res['verificationStatus']}"
+        assert v_res["verificationReason"] != "Test session bypass"
+
+        # Also test endpoint level with non-speech sine wave audio: must reject as SPOOF when DEBUG=False
+        audio_path_block = create_temp_audio(4.2)
+        timestamps_block = [100.0 + i * 33.33 for i in range(120)]
+        movement_block = [0.1 + 0.05 * np.sin(i * 0.2) for i in range(120)]
+        try:
+            with open(audio_path_block, "rb") as audio_file:
+                resp_block = client.post(
+                    "/api/sync",
+                    files={"file": ("recording.wav", audio_file, "audio/wav")},
+                    data={
+                        "lipMovement": json.dumps(movement_block),
+                        "lipTimestamps": json.dumps(timestamps_block),
+                        "sessionId": "test-session-prod-block",
+                        "challengePhrase": "test phrase"
+                    }
+                )
+            assert resp_block.status_code == 200, f"Expected 200, got {resp_block.status_code}"
+            data_block = resp_block.json()
+            assert data_block["livenessResult"] == "SPOOF", f"Expected SPOOF in DEBUG=False, got {data_block['livenessResult']}"
+            assert "phrase" in data_block["rejectionReason"].lower() or "speech" in data_block["rejectionReason"].lower()
+        finally:
+            if os.path.exists(audio_path_block):
+                os.remove(audio_path_block)
+
+        print("[PASS] Scenario 11 (DEBUG=False blocks test-session bypass and enforces phrase verification)")
+    except Exception as e:
+        print(f"[FAIL] Scenario 11 (DEBUG=False blocks test-session bypass): {str(e)}")
+        all_passed = False
+    finally:
+        settings.DEBUG = orig_debug
 
     if all_passed:
         print("\nALL SCENARIOS PASSED SUCCESSFULLY!")

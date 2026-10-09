@@ -3,15 +3,23 @@ import time
 import math
 from faster_whisper import WhisperModel
 from backend.config import settings
+from backend.services.verification_service import normalize_language_code, normalize_text
 
 class WhisperService:
     """
     Service integrating Faster Whisper models to transcribe the speech 
     contained within the uploaded audio track and check matching correctness.
+    Supports multilingual transcription for English ('en'), Hindi ('hi'), and Marathi ('mr').
     """
     
+    _INITIAL_PROMPTS = {
+        "hi": "नमस्ते, नीला आकाश एक दो तीन चार पांच छह सात आठ नौ।",
+        "mr": "नमस्कार, निळा आकाश एक दोन तीन चार पाच सहा सात आठ नऊ.",
+    }
+
     def __init__(self):
         self.model = None
+        self.multilingual_model = None
         
     def load_model(self):
         """
@@ -28,13 +36,38 @@ class WhisperService:
             except Exception as e:
                 print(f"Failed to load Faster Whisper model '{model_name}': {e}")
                 raise e
-        
-    def transcribe_audio(self, audio_filepath: str) -> dict:
+
+    def _get_model_for_language(self, lang_code: str):
         """
-        Transcribes the audio track using the loaded Faster Whisper model.
+        Returns the primary model for English ('en') and the multilingual model
+        (e.g. 'small') for Hindi ('hi') and Marathi ('mr') so Devanagari script
+        output is accurate, falling back to self.model if needed.
+        """
+        if self.model is None:
+            self.load_model()
+        if lang_code in ("hi", "mr"):
+            ml_name = getattr(settings, "WHISPER_MULTILINGUAL_MODEL", settings.WHISPER_MODEL)
+            if ml_name == settings.WHISPER_MODEL:
+                return self.model
+            if self.multilingual_model is None:
+                try:
+                    print(f"Loading Faster Whisper multilingual model '{ml_name}' on CPU...")
+                    self.multilingual_model = WhisperModel(ml_name, device="cpu", compute_type="int8")
+                    print(f"Faster Whisper multilingual model '{ml_name}' loaded successfully.")
+                except Exception as e:
+                    print(f"Could not load multilingual model '{ml_name}', falling back to '{settings.WHISPER_MODEL}': {e}")
+                    self.multilingual_model = self.model
+            return self.multilingual_model
+        return self.model
+        
+    def transcribe_audio(self, audio_filepath: str, language: str = "en") -> dict:
+        """
+        Transcribes the audio track using the loaded Faster Whisper model
+        with the selected language ('en', 'hi', or 'mr').
         
         Inputs:
             audio_filepath (str): Path to the temporary audio file.
+            language (str): Language code ('en', 'hi', 'mr'). Defaults to 'en'.
             
         Outputs:
             dict: Structured transcription results dictionary.
@@ -45,13 +78,34 @@ class WhisperService:
         if not os.path.exists(audio_filepath):
             raise FileNotFoundError(f"Audio file not found: {audio_filepath}")
             
+        lang_code = normalize_language_code(language)
+        active_model = self._get_model_for_language(lang_code)
+        initial_prompt = self._INITIAL_PROMPTS.get(lang_code)
         start_time = time.time()
         
         try:
             # transcribe returns a generator (segments) and transcription info
-            segments, info = self.model.transcribe(audio_filepath, beam_size=5, language="en")
-            # Transcription happens lazily, force execution by listing segments
-            segments_list = list(segments)
+            # Use vad_filter=True and condition_on_previous_text=False to prevent
+            # non-speech/silence hallucination loops across English, Hindi, and Marathi
+            try:
+                segments, info = active_model.transcribe(
+                    audio_filepath,
+                    beam_size=5,
+                    language=lang_code,
+                    initial_prompt=initial_prompt,
+                    vad_filter=True,
+                    condition_on_previous_text=False
+                )
+                segments_list = list(segments)
+            except Exception:
+                segments, info = active_model.transcribe(
+                    audio_filepath,
+                    beam_size=5,
+                    language=lang_code,
+                    initial_prompt=initial_prompt,
+                    condition_on_previous_text=False
+                )
+                segments_list = list(segments)
             
             # Combine segments into single string
             text = " ".join([segment.text for segment in segments_list]).strip()
@@ -68,7 +122,8 @@ class WhisperService:
             return {
                 "success": True,
                 "text": text,
-                "language": info.language,
+                "language": lang_code,
+                "detected_language": getattr(info, "language", lang_code),
                 "processing_time_ms": processing_time_ms,
                 "confidence": confidence,
                 "duration": info.duration,
@@ -80,17 +135,16 @@ class WhisperService:
             raise e
 
 
-    def verify_speech_match(self, transcription: str, challenge_phrase: str) -> bool:
+    def verify_speech_match(self, transcription: str, challenge_phrase: str, language: str = "en") -> bool:
         """
-        Compares the transcribed speech with the challenge text, ensuring 
-        similarity (simple word overlap or lowercase equality).
+        Compares the transcribed speech with the challenge text using
+        language-aware Unicode and number normalization.
         """
         if not transcription or not challenge_phrase:
             return False
-        # Strip punctuation, convert to lowercase and strip whitespace
-        t_clean = "".join([c.lower() for c in transcription if c.isalnum() or c.isspace()]).strip()
-        c_clean = "".join([c.lower() for c in challenge_phrase if c.isalnum() or c.isspace()]).strip()
-        return t_clean == c_clean
+        t_clean = normalize_text(transcription, language=language)
+        c_clean = normalize_text(challenge_phrase, language=language)
+        return bool(t_clean and t_clean == c_clean)
 
 # Global singleton instance
 whisper_service = WhisperService()

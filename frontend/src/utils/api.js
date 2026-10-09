@@ -9,7 +9,7 @@
  * @param {AbortSignal} abortSignal Abort controller signal for cancellation
  * @returns {Promise<Object>} Backend response JSON
  */
-export const uploadAudioForVerification = (audioBlob, challengePhrase, sessionId, onProgress, abortSignal) => {
+export const uploadAudioForVerification = (audioBlob, challengePhrase, sessionId, onProgress, abortSignal, language = 'en') => {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', '/api/transcribe');
@@ -68,6 +68,7 @@ export const uploadAudioForVerification = (audioBlob, challengePhrase, sessionId
     formData.append('file', audioBlob, 'recording.webm');
     formData.append('challengePhrase', challengePhrase || '');
     formData.append('sessionId', sessionId || '');
+    formData.append('language', language || 'en');
     
     xhr.send(formData);
   });
@@ -99,11 +100,13 @@ export const resetSessionAttempts = async (sessionId) => {
  * Fetches a dynamically generated challenge phrase from the backend.
  * 
  * @param {string} sessionId Active session ID
- * @returns {Promise<Object>} Server response JSON containing the challengePhrase
+ * @param {string} language Selected language code ('en' | 'hi' | 'mr')
+ * @returns {Promise<Object>} Server response JSON containing the challengePhrase and language
  */
-export const fetchNewChallengePhrase = async (sessionId) => {
+export const fetchNewChallengePhrase = async (sessionId, language = 'en') => {
   if (!sessionId) return;
-  const response = await fetch(`/api/transcribe/challenge/new?sessionId=${sessionId}`);
+  const langParam = encodeURIComponent(language || 'en');
+  const response = await fetch(`/api/transcribe/challenge/new?sessionId=${encodeURIComponent(sessionId)}&language=${langParam}`);
   
   if (!response.ok) {
     throw new Error(`Failed to fetch challenge phrase: ${response.statusText}`);
@@ -120,16 +123,117 @@ export const fetchNewChallengePhrase = async (sessionId) => {
  * @param {Array<number>} lipTimestamps Timestamps of lip frames relative to recording start
  * @param {string} sessionId Active session ID
  * @param {AbortSignal} abortSignal Abort controller signal for cancellation
+ * @param {string} challengePhrase Active challenge phrase
+ * @param {string} userId User profile ID
+ * @param {string} language Selected language code ('en' | 'hi' | 'mr')
  * @returns {Promise<Object>} Backend response JSON
  */
-export const uploadAudioForSync = async (audioBlob, lipMovement, lipTimestamps, sessionId, abortSignal) => {
+export const uploadAudioForSync = async (audioBlob, lipMovement, lipTimestamps, sessionId, abortSignal, challengePhrase = '', userId = '', language = 'en') => {
   const formData = new FormData();
   formData.append('file', audioBlob, 'recording.webm');
   formData.append('lipMovement', JSON.stringify(lipMovement));
   formData.append('lipTimestamps', JSON.stringify(lipTimestamps));
   formData.append('sessionId', sessionId || '');
+  if (challengePhrase) {
+    formData.append('challengePhrase', challengePhrase);
+  }
+  if (userId) {
+    formData.append('userId', userId);
+  }
+  formData.append('language', language || 'en');
 
   const response = await fetch('/api/sync', {
+    method: 'POST',
+    body: formData,
+    signal: abortSignal
+  });
+
+  if (!response.ok) {
+    const errData = await response.json().catch(() => ({}));
+    const msg = errData.error?.message || errData.detail || `Server error: status ${response.status}`;
+    const error = new Error(msg);
+    error.status = response.status;
+    error.code = errData.error?.code;
+    throw error;
+  }
+
+  return response.json();
+};
+
+/**
+ * Fetches the current per-user synchronization calibration profile.
+ *
+ * @param {string} userId User profile identifier
+ * @returns {Promise<Object>} Calibration status payload
+ */
+export const fetchCalibrationStatus = async (userId) => {
+  if (!userId) return null;
+  const response = await fetch(`/api/calibration/status?userId=${encodeURIComponent(userId)}`);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch calibration status: ${response.statusText}`);
+  }
+  return response.json();
+};
+
+/**
+ * Starts or resets a per-user synchronization calibration profile.
+ *
+ * @param {string} userId User profile identifier
+ * @param {string} sessionId Optional session ID
+ * @param {number} requiredSamples Number of required valid samples (default 3)
+ * @returns {Promise<Object>} Reset calibration profile payload
+ */
+export const startNewCalibration = async (userId, sessionId = '', requiredSamples = 3) => {
+  const formData = new FormData();
+  formData.append('userId', userId || '');
+  if (sessionId) {
+    formData.append('sessionId', sessionId);
+  }
+  if (requiredSamples) {
+    formData.append('requiredSamples', String(requiredSamples));
+  }
+
+  const response = await fetch('/api/calibration/start', {
+    method: 'POST',
+    body: formData
+  });
+
+  if (!response.ok) {
+    const errData = await response.json().catch(() => ({}));
+    throw new Error(errData.error?.message || `Failed to start calibration: ${response.statusText}`);
+  }
+  return response.json();
+};
+
+/**
+ * Submits a single recorded sample for per-user adaptive threshold calibration.
+ */
+export const uploadCalibrationSample = async (
+  audioBlob,
+  lipMovement,
+  lipTimestamps,
+  sessionId,
+  userId,
+  challengePhrase = '',
+  abortSignal = null,
+  requiredSamples = 3,
+  language = 'en'
+) => {
+  const formData = new FormData();
+  formData.append('file', audioBlob, 'recording.webm');
+  formData.append('lipMovement', JSON.stringify(lipMovement));
+  formData.append('lipTimestamps', JSON.stringify(lipTimestamps));
+  formData.append('sessionId', sessionId || '');
+  formData.append('userId', userId || sessionId || '');
+  if (challengePhrase) {
+    formData.append('challengePhrase', challengePhrase);
+  }
+  if (requiredSamples) {
+    formData.append('requiredSamples', String(requiredSamples));
+  }
+  formData.append('language', language || 'en');
+
+  const response = await fetch('/api/calibration/sample', {
     method: 'POST',
     body: formData,
     signal: abortSignal

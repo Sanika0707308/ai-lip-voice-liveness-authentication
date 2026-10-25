@@ -101,27 +101,23 @@ def run_multilingual_tests():
     data_en = res_en.json()
     assert data_en["language"] == "en"
     tokens_en = data_en["challengePhrase"].split()
-    assert len(tokens_en) in (4, 5) and tokens_en[-1].isdigit() and len(tokens_en[-1]) in (3, 4)
+    assert 4 <= len(tokens_en) <= 7 and not any(ch.isdigit() for ch in data_en["challengePhrase"])
 
     res_hi = client.get("/api/transcribe/challenge/new?sessionId=ml-chal-hi&language=hi")
     assert res_hi.status_code == 200
     data_hi = res_hi.json()
     assert data_hi["language"] == "hi"
     tokens_hi = data_hi["challengePhrase"].split()
-    assert len(tokens_hi) in (5, 6)
-    assert tokens_hi[0] in HI_ADJECTIVES
-    assert tokens_hi[1] in HI_NOUNS
-    assert all(t in HI_NUMBERS for t in tokens_hi[-3:])
+    assert 4 <= len(tokens_hi) <= 7 and not any(ch.isdigit() for ch in data_hi["challengePhrase"])
+    assert any('\u0900' <= ch <= '\u097F' for ch in data_hi["challengePhrase"])
 
     res_mr = client.get("/api/transcribe/challenge/new?sessionId=ml-chal-mr&language=mr")
     assert res_mr.status_code == 200
     data_mr = res_mr.json()
     assert data_mr["language"] == "mr"
     tokens_mr = data_mr["challengePhrase"].split()
-    assert len(tokens_mr) in (5, 6)
-    assert tokens_mr[0] in MR_ADJECTIVES
-    assert tokens_mr[1] in MR_NOUNS
-    assert all(t in MR_NUMBERS for t in tokens_mr[-3:])
+    assert 4 <= len(tokens_mr) <= 7 and not any(ch.isdigit() for ch in data_mr["challengePhrase"])
+    assert any('\u0900' <= ch <= '\u097F' for ch in data_mr["challengePhrase"])
 
     # Fallback on unsupported language code -> defaults to 'en'
     res_fb = client.get("/api/transcribe/challenge/new?sessionId=ml-chal-fb&language=fr")
@@ -169,15 +165,15 @@ def run_multilingual_tests():
     wav_path, lip_mov, lip_ts = create_modulated_audio_and_lips(duration_sec=4.0, offset_sec=0.03)
     try:
         sess_en_live = "ml-sync-en-live"
-        en_phrase = "silent river moves 482"
+        en_phrase = "Today is a beautiful day"
         with patch.object(
             whisper_service,
             "transcribe_audio",
             return_value={
                 "success": True,
-                "text": "Silent river moves four eight two.",
+                "text": "Today is a beautiful day.",
                 "language": "en",
-                "confidence": 0.94,
+                "confidence": 0.95,
                 "duration_ms": 4000,
             },
         ):
@@ -212,7 +208,7 @@ def run_multilingual_tests():
             "transcribe_audio",
             return_value={
                 "success": True,
-                "text": "golden mountain jumps nine one two",
+                "text": "I enjoy walking in nature",
                 "language": "en",
                 "confidence": 0.92,
                 "duration_ms": 4000,
@@ -276,15 +272,15 @@ def run_multilingual_tests():
         # TEST 6: Hindi Correct Challenge + Synchronized Lip-Voice -> LIVE
         # ------------------------------------------------------------------
         sess_hi_live = "ml-sync-hi-live"
-        hi_phrase = "नीला आकाश बोले सात"
+        hi_phrase = "आज का दिन बहुत सुंदर है"
         with patch.object(
             whisper_service,
             "transcribe_audio",
             return_value={
                 "success": True,
-                "text": "नीला आकाश बोले 7।",
+                "text": "आज का दिन बहुत सुंदर है।",
                 "language": "hi",
-                "confidence": 0.91,
+                "confidence": 0.95,
                 "duration_ms": 4000,
             },
         ):
@@ -307,7 +303,7 @@ def run_multilingual_tests():
         assert body["isChallengeMatch"] is True
         assert body["isSyncValid"] is True
         assert body["livenessResult"] == "LIVE"
-        print(f"[PASS] 6. Hindi (hi) Correct Challenge ('{hi_phrase}' vs 'नीला आकाश बोले 7।') + Sync -> LIVE")
+        print(f"[PASS] 6. Hindi (hi) Correct Challenge ('{hi_phrase}' vs 'आज का दिन बहुत सुंदर है।') + Sync -> LIVE")
         passed += 1
 
         # ------------------------------------------------------------------
@@ -319,7 +315,7 @@ def run_multilingual_tests():
             "transcribe_audio",
             return_value={
                 "success": True,
-                "text": "हरा पर्वत चले तीन",
+                "text": "कल सुबह बारिश होगी",
                 "language": "hi",
                 "confidence": 0.89,
                 "duration_ms": 4000,
@@ -384,15 +380,15 @@ def run_multilingual_tests():
         # TEST 9: Marathi Correct Challenge + Synchronized Lip-Voice -> LIVE
         # ------------------------------------------------------------------
         sess_mr_live = "ml-sync-mr-live"
-        mr_phrase = "नवीन पुस्तक वाचा दोन"
+        mr_phrase = "मला गाणी ऐकायला आवडतात"
         with patch.object(
             whisper_service,
             "transcribe_audio",
             return_value={
                 "success": True,
-                "text": "नवीन पुस्तक वाचा २!",
+                "text": "मला गाणी ऐकायला आवडतात!",
                 "language": "mr",
-                "confidence": 0.90,
+                "confidence": 0.92,
                 "duration_ms": 4000,
             },
         ):
@@ -415,7 +411,7 @@ def run_multilingual_tests():
         assert body["isChallengeMatch"] is True
         assert body["isSyncValid"] is True
         assert body["livenessResult"] == "LIVE"
-        print(f"[PASS] 9. Marathi (mr) Correct Challenge ('{mr_phrase}' vs 'नवीन पुस्तक वाचा २!') + Sync -> LIVE")
+        print(f"[PASS] 9. Marathi (mr) Correct Challenge ('{mr_phrase}' vs 'मला गाणी ऐकायला आवडतात!') + Sync -> LIVE")
         passed += 1
 
         # ------------------------------------------------------------------
@@ -427,7 +423,7 @@ def run_multilingual_tests():
             "transcribe_audio",
             return_value={
                 "success": True,
-                "text": "सुंदर आकाश पहा नऊ",
+                "text": "पक्षी आकाशात उडतात",
                 "language": "mr",
                 "confidence": 0.88,
                 "duration_ms": 4000,

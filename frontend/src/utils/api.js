@@ -128,7 +128,50 @@ export const fetchNewChallengePhrase = async (sessionId, language = 'en') => {
  * @param {string} language Selected language code ('en' | 'hi' | 'mr')
  * @returns {Promise<Object>} Backend response JSON
  */
-export const uploadAudioForSync = async (audioBlob, lipMovement, lipTimestamps, sessionId, abortSignal, challengePhrase = '', userId = '', language = 'en') => {
+export const uploadAudioForSync = async (
+  audioBlob,
+  lipMovement,
+  lipTimestamps,
+  sessionId,
+  abortSignalOrChallenge = '',
+  challengePhraseOrUserId = '',
+  userIdOrLanguage = '',
+  languageOrAttemptId = 'en',
+  attemptIdArg = ''
+) => {
+  let signal = null;
+  let challengePhrase = '';
+  let userId = '';
+  let language = 'en';
+  let attemptId = '';
+
+  // Robust argument resolution supporting both 8-param and 9-param signatures:
+  // Signature A: (audioBlob, lipMovement, lipTimestamps, sessionId, abortSignalOrNull, challengePhrase, userId, language, attemptId)
+  // Signature B: (audioBlob, lipMovement, lipTimestamps, sessionId, challengePhrase, userId, language, attemptId)
+  const isSignalOrNull = abortSignalOrChallenge === null || 
+                         abortSignalOrChallenge === undefined || 
+                         (typeof abortSignalOrChallenge === 'object' && ('aborted' in abortSignalOrChallenge || (typeof AbortSignal !== 'undefined' && abortSignalOrChallenge instanceof AbortSignal)));
+
+  if (isSignalOrNull) {
+    signal = (abortSignalOrChallenge && typeof abortSignalOrChallenge === 'object') ? abortSignalOrChallenge : null;
+    challengePhrase = challengePhraseOrUserId || '';
+    userId = userIdOrLanguage || '';
+    language = languageOrAttemptId || 'en';
+    attemptId = attemptIdArg || '';
+  } else {
+    // 5th param is challengePhrase directly
+    signal = null;
+    challengePhrase = (typeof abortSignalOrChallenge === 'string') ? abortSignalOrChallenge : '';
+    userId = challengePhraseOrUserId || '';
+    language = userIdOrLanguage || 'en';
+    attemptId = languageOrAttemptId || '';
+  }
+
+  // Ensure language is a valid normalized code
+  const candidateLangs = [language, languageOrAttemptId, userIdOrLanguage].filter(Boolean);
+  const matchedLang = candidateLangs.find(l => ['en', 'hi', 'mr'].includes(String(l).toLowerCase()));
+  language = matchedLang ? matchedLang.toLowerCase() : (['hi', 'mr'].includes(language) ? language : 'en');
+
   const formData = new FormData();
   formData.append('file', audioBlob, 'recording.webm');
   formData.append('lipMovement', JSON.stringify(lipMovement));
@@ -141,11 +184,14 @@ export const uploadAudioForSync = async (audioBlob, lipMovement, lipTimestamps, 
     formData.append('userId', userId);
   }
   formData.append('language', language || 'en');
+  if (attemptId) {
+    formData.append('attemptId', attemptId);
+  }
 
   const response = await fetch('/api/sync', {
     method: 'POST',
     body: formData,
-    signal: abortSignal
+    signal: signal
   });
 
   if (!response.ok) {
@@ -250,4 +296,140 @@ export const uploadCalibrationSample = async (
 
   return response.json();
 };
+
+/**
+ * ============================================================================
+ * LIVESCAN 2.0 Monitoring and Proctoring APIs
+ * ============================================================================
+ */
+
+export const startMonitoringSession = async (sessionId, candidateId = '', examId = '', language = 'en') => {
+  const formData = new FormData();
+  formData.append('sessionId', sessionId);
+  if (candidateId) formData.append('candidateId', candidateId);
+  if (examId) formData.append('examId', examId);
+  formData.append('language', language || 'en');
+
+  const response = await fetch('/api/monitoring/session/start', {
+    method: 'POST',
+    body: formData
+  });
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to start monitoring session.');
+  }
+  return response.json();
+};
+
+export const stopMonitoringSession = async (sessionId, reason = 'User completed monitoring session') => {
+  const formData = new FormData();
+  formData.append('sessionId', sessionId);
+  formData.append('reason', reason);
+
+  const response = await fetch('/api/monitoring/session/stop', {
+    method: 'POST',
+    body: formData
+  });
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to stop monitoring session.');
+  }
+  return response.json();
+};
+
+export const fetchSessionReport = async (sessionId) => {
+  if (!sessionId) return null;
+  const response = await fetch(`/api/monitoring/session/${encodeURIComponent(sessionId)}/report`);
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to fetch session report.');
+  }
+  return response.json();
+};
+
+export const fetchMonitoringSessions = async (limit = 25) => {
+  const response = await fetch(`/api/monitoring/sessions?limit=${limit}`);
+  if (!response.ok) {
+    throw new Error('Failed to fetch monitoring sessions history.');
+  }
+  return response.json();
+};
+
+export const logMonitoringEvent = async (sessionId, eventType, severity = 'INFO', details = '', metadata = null) => {
+  const formData = new FormData();
+  formData.append('sessionId', sessionId);
+  formData.append('eventType', eventType);
+  formData.append('severity', severity);
+  formData.append('details', details);
+  if (metadata) {
+    formData.append('metadata', typeof metadata === 'string' ? metadata : JSON.stringify(metadata));
+  }
+
+  const response = await fetch('/api/monitoring/event', {
+    method: 'POST',
+    body: formData
+  });
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to log monitoring event.');
+  }
+  return response.json();
+};
+
+export const sendMonitoringPersonFrame = async (sessionId, imageBlob = null, clientPersonCount = null) => {
+  const formData = new FormData();
+  formData.append('sessionId', sessionId);
+  if (imageBlob) {
+    formData.append('file', imageBlob, 'frame.jpg');
+  }
+  if (clientPersonCount !== null && clientPersonCount !== undefined) {
+    formData.append('clientPersonCount', String(clientPersonCount));
+  }
+
+  const response = await fetch('/api/monitoring/detect-persons', {
+    method: 'POST',
+    body: formData
+  });
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Person detection analysis failed.');
+  }
+  return response.json();
+};
+
+export const sendMonitoringAudioChunk = async (sessionId, audioBlob, language = 'en', verifyWithWhisper = true, candidateSpeaking = null) => {
+  const formData = new FormData();
+  formData.append('sessionId', sessionId);
+  formData.append('file', audioBlob, 'audio_chunk.webm');
+  formData.append('language', language || 'en');
+  formData.append('verifyWithWhisper', verifyWithWhisper ? 'true' : 'false');
+  if (candidateSpeaking !== null && candidateSpeaking !== undefined) {
+    formData.append('candidateSpeaking', candidateSpeaking ? 'true' : 'false');
+  }
+
+  const response = await fetch('/api/monitoring/audio-chunk', {
+    method: 'POST',
+    body: formData
+  });
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Audio chunk analysis failed.');
+  }
+  return response.json();
+};
+
+export const fetchSessionStatus = async (sessionId) => {
+  if (!sessionId) return null;
+  const response = await fetch(`/api/monitoring/session/${encodeURIComponent(sessionId)}/status`);
+  if (!response.ok) {
+    throw new Error('Failed to fetch session status.');
+  }
+  return response.json();
+};
+
 

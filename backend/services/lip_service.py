@@ -1,6 +1,7 @@
 import math
 import numpy as np
 from backend.config import settings
+from backend.services.face_service import face_service
 
 class LipService:
     """
@@ -9,13 +10,13 @@ class LipService:
     """
     
     def __init__(self):
-        # MediaPipe Face Mesh landmark indexes for lips
+        # MediaPipe Face Mesh landmark indexes for lips (sourced from FaceService)
         # 13: Inner upper lip center, 14: Inner lower lip center
         # 61: Inner/outer left corner, 291: Inner/outer right corner
-        self.upper_lip_idx = 13   
-        self.lower_lip_idx = 14   
-        self.left_corner_idx = 61 
-        self.right_corner_idx = 291 
+        self.upper_lip_idx = face_service.UPPER_LIP
+        self.lower_lip_idx = face_service.LOWER_LIP
+        self.left_corner_idx = face_service.LEFT_MOUTH_CORNER
+        self.right_corner_idx = face_service.RIGHT_MOUTH_CORNER 
 
     @staticmethod
     def euclidean_distance(p1, p2) -> float:
@@ -64,6 +65,12 @@ class LipService:
                 
         return ratios
 
+    def verify_face_landmarks(self, face_landmarks: list) -> bool:
+        """
+        Validates facial landmark geometric integrity using FaceService.
+        """
+        return face_service.verify_face_pose(face_landmarks)
+
     def verify_lip_movement(self, aperture_history: list) -> tuple[bool, float]:
         """
         Analyzes the variation in lip opening to confirm active physical movement, 
@@ -80,7 +87,14 @@ class LipService:
             variance = float(np.var(arr))
             if np.isnan(variance) or np.isinf(variance):
                 return False, 0.0
-            is_moving = bool(variance >= settings.MIN_LIP_VARIATION)
+            
+            # Physical lip movement validation:
+            # - Static photo attacks have near-zero variance (< 0.00005) and negligible range (< 0.01).
+            # - Natural conversational speech typically exhibits variance >= MIN_LIP_VARIATION (0.0002)
+            #   or a peak-to-peak aperture opening excursion >= 0.02.
+            min_var = getattr(settings, "MIN_LIP_VARIATION", 0.0002)
+            ptp = float(np.ptp(arr)) if len(arr) > 0 else 0.0
+            is_moving = bool(variance >= min_var or (variance >= 0.0001 and ptp >= 0.02))
             return is_moving, variance
         except (ValueError, TypeError):
             return False, 0.0

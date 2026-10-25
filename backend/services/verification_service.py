@@ -99,8 +99,9 @@ CANONICAL_DIGIT_WORDS = {
 CONTROLLED_NUMBER_TOKEN_MAP = {
     "en": {
         "oh": "zero",
-        "zero": "zero", "one": "one", "two": "two", "three": "three", "four": "four",
-        "five": "five", "six": "six", "seven": "seven", "eight": "eight", "nine": "nine",
+        "zero": "zero", "one": "one", "won": "one", "two": "two", "to": "two", "too": "two",
+        "three": "three", "four": "four", "for": "four", "fore": "four",
+        "five": "five", "six": "six", "seven": "seven", "eight": "eight", "ate": "eight", "nine": "nine",
     },
     "hi": {
         "शून्य": "शून्य", "जीरो": "शून्य", "जिरी": "शून्य", "सीफर": "शून्य", "zero": "शून्य", "oh": "शून्य",
@@ -160,6 +161,10 @@ def normalize_text(text: str, language: str = "en") -> str:
 
     lang = normalize_language_code(language)
 
+    # 0. Strip zero-width joiners/spaces and soft hyphens
+    for zw in ("\u200b", "\u200c", "\u200d", "\ufeff", "\u00ad"):
+        text = text.replace(zw, "")
+
     # 1. Unicode NFC normalization & Devanagari canonicalization
     text = unicodedata.normalize("NFC", text)
     text = text.translate(PRECOMPOSED_NUKTA_MAP)
@@ -197,19 +202,122 @@ def normalize_text(text: str, language: str = "en") -> str:
 
     return " ".join(tokens)
 
+FILLER_WORDS = {
+    "uh", "um", "ah", "er", "hmm", "well", "okay", "ok", "so", "yeah", "yes",
+    "like", "right", "sure", "please", "thank", "thanks", "you",
+    "अरे", "अच्छा", "हाँ", "हा", "हूँ", "हुं", "ओके",
+    "बरं", "होय", "हो", "नक्की"
+}
+
+def strip_boundary_fillers(text: str, reference_text: str = "") -> str:
+    """
+    Strips leading and trailing conversational filler tokens from transcribed text
+    if those tokens are not part of the reference challenge phrase.
+    """
+    ref_tokens = set(reference_text.split()) if reference_text else set()
+    words = text.split()
+    if not words:
+        return ""
+    start = 0
+    while start < len(words) and words[start] in FILLER_WORDS and words[start] not in ref_tokens:
+        start += 1
+    end = len(words)
+    while end > start and words[end - 1] in FILLER_WORDS and words[end - 1] not in ref_tokens:
+        end -= 1
+    return " ".join(words[start:end])
+
+def _devanagari_fuzzy_canonical(w: str) -> str:
+    """
+    Phonetic canonicalization for Devanagari words to resolve minor
+    ASR vowel-length alternations (short/long i, short/long u, e/ai, o/au, nukta, visarga).
+    """
+    w = w.replace("\u0940", "\u093f")  # ी -> ि
+    w = w.replace("\u0942", "\u0941")  # ू -> ु
+    w = w.replace("\u0948", "\u0947")  # ै -> े
+    w = w.replace("\u094c", "\u094b")  # ौ -> ो
+    w = w.replace("\u0937", "\u0936")  # ष -> श
+    w = w.replace("\u0903", "")        # remove visarga ः
+    w = w.replace("\u093d", "")        # remove avagraha ऽ
+    if len(w) > 2 and w.endswith("\u0902"):  # trailing anusvara on plural/inflection
+        w = w[:-1]
+    return w
+
+def calculate_fuzzy_word_match(expected_words: list, recognized_words: list) -> float:
+    """
+    Calculates token-level fuzzy match ratio where minor morphological variations
+    and Devanagari vowel-length transcription alternations are granted match credit.
+    """
+    if not expected_words and not recognized_words:
+        return 1.0
+    if not expected_words or not recognized_words:
+        return 0.0
+
+    matched_credits = 0.0
+    used_indices = set()
+    for ew in expected_words:
+        best_sim = 0.0
+        best_idx = -1
+        ew_canon = _devanagari_fuzzy_canonical(ew)
+        for idx, rw in enumerate(recognized_words):
+            if idx in used_indices:
+                continue
+            if ew == rw or (ew_canon and ew_canon == _devanagari_fuzzy_canonical(rw)):
+                best_sim = 1.0
+                best_idx = idx
+                break
+            # Standard sequence matcher ratio
+            sim_std = SequenceMatcher(None, ew, rw).ratio()
+            # Devanagari canonical sequence matcher ratio
+            sim_canon = SequenceMatcher(None, ew_canon, _devanagari_fuzzy_canonical(rw)).ratio()
+            sim = max(sim_std, sim_canon)
+            if sim >= 0.75 and sim > best_sim:
+                best_sim = sim
+                best_idx = idx
+        if best_idx != -1 and best_sim >= 0.75:
+            used_indices.add(best_idx)
+            matched_credits += 1.0 if best_sim >= 0.90 else 0.85
+
+    return (2.0 * matched_credits) / (len(expected_words) + len(recognized_words))
+
 def calculate_character_similarity(expected: str, recognized: str) -> float:
     """
-    Calculates character-level similarity percentage (0-100) using difflib.SequenceMatcher.
+    Calculates character-level similarity percentage (0-100) using difflib.SequenceMatcher,
+    augmented with best-window matching if recognized string has leading/trailing context.
     """
     if not expected and not recognized:
         return 100.0
     if not expected or not recognized:
         return 0.0
-    return SequenceMatcher(None, expected, recognized).ratio() * 100
+
+    global_ratio = SequenceMatcher(None, expected, recognized).ratio()
+    canon_exp = _devanagari_fuzzy_canonical(expected)
+    canon_rec = _devanagari_fuzzy_canonical(recognized)
+    canon_ratio = SequenceMatcher(None, canon_exp, canon_rec).ratio() if canon_exp else 0.0
+    best_ratio = max(global_ratio, canon_ratio)
+
+    # If recognized text is longer than expected, evaluate sliding windows
+    len_exp = len(expected)
+    len_rec = len(recognized)
+    if len_rec > len_exp:
+        if expected in recognized:
+            return 100.0
+        margin = int(len_exp * 0.3) + 5
+        min_win = max(1, len_exp - margin)
+        max_win = min(len_rec, len_exp + margin)
+        step = max(1, len_exp // 10)
+        for w_len in range(min_win, max_win + 1, step):
+            for start in range(0, len_rec - w_len + 1, step):
+                sub = recognized[start:start + w_len]
+                ratio = SequenceMatcher(None, expected, sub).ratio()
+                if ratio > best_ratio:
+                    best_ratio = ratio
+
+    return float(best_ratio * 100.0)
 
 def calculate_word_similarity(expected: str, recognized: str) -> float:
     """
-    Calculates word-level similarity percentage (0-100) using SequenceMatcher over token lists.
+    Calculates word-level similarity percentage (0-100) using SequenceMatcher over token lists,
+    augmented with sliding-window alignment and fuzzy token morphology matching.
     """
     words_expected = expected.split()
     words_recognized = recognized.split()
@@ -217,7 +325,30 @@ def calculate_word_similarity(expected: str, recognized: str) -> float:
         return 100.0
     if not words_expected or not words_recognized:
         return 0.0
-    return SequenceMatcher(None, words_expected, words_recognized).ratio() * 100
+
+    # 1. Base SequenceMatcher ratio
+    base_ratio = SequenceMatcher(None, words_expected, words_recognized).ratio()
+
+    # 2. Fuzzy word match ratio over full text
+    fuzzy_ratio = calculate_fuzzy_word_match(words_expected, words_recognized)
+    best_ratio = max(base_ratio, fuzzy_ratio)
+
+    # 3. If recognized text has extra words, check sliding windows
+    n_exp = len(words_expected)
+    n_rec = len(words_recognized)
+    if n_rec > n_exp:
+        min_win = max(1, n_exp - 1)
+        max_win = min(n_rec, n_exp + 2)
+        for w_len in range(min_win, max_win + 1):
+            for start in range(n_rec - w_len + 1):
+                window = words_recognized[start:start + w_len]
+                w_base = SequenceMatcher(None, words_expected, window).ratio()
+                w_fuz = calculate_fuzzy_word_match(words_expected, window)
+                win_score = max(w_base, w_fuz)
+                if win_score > best_ratio:
+                    best_ratio = win_score
+
+    return float(best_ratio * 100.0)
 
 def calculate_weighted_score(char_score: float, word_score: float, confidence: float) -> float:
     """
@@ -225,16 +356,25 @@ def calculate_weighted_score(char_score: float, word_score: float, confidence: f
     - Character Similarity (40%)
     - Word Similarity (40%)
     - Whisper Confidence (20%)
+    
+    If text match is high (char and word scores >= 75%), Whisper's acoustic confidence
+    alone will not drag a correct recitation below the verification threshold.
     """
-    # Ensure confidence is formatted as percentage 0-100
     confidence_percentage = confidence * 100
     
     w_char = settings.WEIGHT_CHARACTER_SIMILARITY
     w_word = settings.WEIGHT_WORD_SIMILARITY
     w_conf = settings.WEIGHT_WHISPER_CONFIDENCE
     
-    weighted_score = (char_score * w_char) + (word_score * w_word) + (confidence_percentage * w_conf)
-    return weighted_score
+    standard_score = (char_score * w_char) + (word_score * w_word) + (confidence_percentage * w_conf)
+    
+    # Textual similarity score
+    text_score = (char_score * 0.5) + (word_score * 0.5)
+    if text_score >= 75.0:
+        blended_score = (text_score * 0.85) + (confidence_percentage * 0.15)
+        return float(max(standard_score, blended_score))
+    
+    return float(standard_score)
 
 def get_adaptive_threshold(expected_phrase: str) -> float:
     """
@@ -290,10 +430,16 @@ class VerificationEngine:
         # 1. Normalization (language-aware)
         norm_expected = normalize_text(expected_phrase, language=lang_code)
         norm_recognized = normalize_text(recognized_text, language=lang_code)
+        cleaned_recognized = strip_boundary_fillers(norm_recognized, norm_expected)
         
         # 2. Similarity Calculations
         char_sim = calculate_character_similarity(norm_expected, norm_recognized)
         word_sim = calculate_word_similarity(norm_expected, norm_recognized)
+        if cleaned_recognized and cleaned_recognized != norm_recognized:
+            clean_char_sim = calculate_character_similarity(norm_expected, cleaned_recognized)
+            clean_word_sim = calculate_word_similarity(norm_expected, cleaned_recognized)
+            char_sim = max(char_sim, clean_char_sim)
+            word_sim = max(word_sim, clean_word_sim)
         
         # 3. Weighted Scoring
         overall_score = calculate_weighted_score(char_sim, word_sim, whisper_confidence)

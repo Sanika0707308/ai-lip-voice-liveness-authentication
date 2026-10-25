@@ -15,7 +15,7 @@ class Settings:
     # Biometric Assessment Thresholds
     LIP_CORRELATION_THRESHOLD: float = float(os.getenv("LIP_CORRELATION_THRESHOLD", "0.65"))
     MIN_FACE_CONFIDENCE: float = float(os.getenv("MIN_FACE_CONFIDENCE", "0.5"))
-    MIN_LIP_VARIATION: float = float(os.getenv("MIN_LIP_VARIATION", "0.001"))
+    MIN_LIP_VARIATION: float = float(os.getenv("MIN_LIP_VARIATION", "0.0002"))
     
     # Synchronization parameters
     SYNC_WINDOW_MS: int = int(os.getenv("SYNC_WINDOW_MS", "300"))
@@ -42,12 +42,14 @@ class Settings:
         "hi": "Hindi",
         "mr": "Marathi"
     }
-    MAX_VERIFICATION_ATTEMPTS: int = int(os.getenv("MAX_VERIFICATION_ATTEMPTS", "5"))
+    MAX_VERIFICATION_ATTEMPTS: int = int(os.getenv("MAX_VERIFICATION_ATTEMPTS", "3"))
+    MAX_MONITORING_WARNINGS: int = int(os.getenv("MAX_MONITORING_WARNINGS", "3"))
     AUDIO_MIN_DURATION_SEC: float = float(os.getenv("AUDIO_MIN_DURATION_SEC", "2.0"))
     AUDIO_MAX_DURATION_SEC: float = float(os.getenv("AUDIO_MAX_DURATION_SEC", "6.0"))
     TARGET_RECORDING_DURATION_SEC: float = 5.0
     WHISPER_CONFIDENCE_THRESHOLD: float = float(os.getenv("WHISPER_CONFIDENCE_THRESHOLD", "0.60"))
     CHALLENGE_MATCH_THRESHOLD: float = float(os.getenv("CHALLENGE_MATCH_THRESHOLD", "70.0"))
+    CHALLENGE_TIMEOUT_SECONDS: int = int(os.getenv("CHALLENGE_TIMEOUT_SECONDS", "60"))
 
     # Score weights
     WEIGHT_CHARACTER_SIMILARITY: float = 0.40
@@ -58,6 +60,19 @@ class Settings:
     MONGODB_URI: str = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
     DATABASE_NAME: str = os.getenv("DATABASE_NAME", "liveness_db")
 
+    # LIVESCAN 2.0 Interview Monitoring Configurations
+    MONITORING_PERSON_CONFIRMATION_FRAMES: int = int(os.getenv("MONITORING_PERSON_CONFIRMATION_FRAMES", "3"))
+    MONITORING_PERSON_CLEAR_SEC: float = float(os.getenv("MONITORING_PERSON_CLEAR_SEC", "2.0"))
+    MONITORING_ALERT_COOLDOWN_SEC: float = float(os.getenv("MONITORING_ALERT_COOLDOWN_SEC", "5.0"))
+    
+    # Background Speech & VAD Configurations
+    VAD_ENERGY_THRESHOLD: float = float(os.getenv("VAD_ENERGY_THRESHOLD", "0.015"))
+    VAD_SPEECH_COOLDOWN_SEC: float = float(os.getenv("VAD_SPEECH_COOLDOWN_SEC", "4.0"))
+    VAD_MIN_SPEECH_DURATION_SEC: float = float(os.getenv("VAD_MIN_SPEECH_DURATION_SEC", "0.5"))
+    VAD_CONFIDENCE_THRESHOLD: float = float(os.getenv("VAD_CONFIDENCE_THRESHOLD", "0.60"))
+    VAD_WINDOW_CHUNK_SEC: float = float(os.getenv("VAD_WINDOW_CHUNK_SEC", "2.0"))
+
 settings = Settings()
+
 
 

@@ -10,14 +10,14 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from backend.config import settings
-from backend.routes import health, liveness, transcription
+from backend.routes import health, liveness, transcription, monitoring
 from backend.services.whisper_service import whisper_service
 
 # Initialize FastAPI App
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    description="Multimodal Biometric Anti-Spoofing system coordinating lip movements & voice patterns.",
-    version="1.0.0",
+    description="LIVESCAN 2.0: AI-Based Liveness Verification & Online Interview & Examination Monitoring System.",
+    version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -35,6 +35,8 @@ app.add_middleware(
 app.include_router(health.router, prefix=settings.API_V1_STR)
 app.include_router(liveness.router, prefix=settings.API_V1_STR)
 app.include_router(transcription.router, prefix=settings.API_V1_STR)
+app.include_router(monitoring.router, prefix=settings.API_V1_STR)
+
 
 @app.on_event("startup")
 async def startup_event():

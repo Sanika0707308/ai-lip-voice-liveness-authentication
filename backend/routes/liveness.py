@@ -58,7 +58,8 @@ async def sync_lip_voice(
     sessionId: str = Form(...),
     challengePhrase: str = Form(None),
     userId: str = Form(None),
-    language: str = Form(None)
+    language: str = Form(None),
+    attemptId: str = Form(None)
 ):
     """
     Endpoint to validate video/audio and lip coordinate timestamps, 
@@ -88,7 +89,10 @@ async def sync_lip_voice(
                 "error": {
                     "code": "RATE_LIMIT_EXCEEDED",
                     "message": f"Rate limit exceeded. Maximum {limit} attempts allowed per authentication session."
-                }
+                },
+                "isSessionExpired": True,
+                "attemptsUsed": limit,
+                "attemptsRemaining": 0
             }
         )
 
@@ -288,28 +292,43 @@ async def sync_lip_voice(
         lang_code = normalize_language_code(
             language if (language and language.strip()) else attempt_tracker.get_language(sessionId)
         )
-        attempt_tracker.set_language(sessionId, lang_code)
 
-        # Fetch dynamic challenge phrase (from tracker or fallback parameter)
-        expected_phrase = attempt_tracker.get_challenge(sessionId)
-        if not expected_phrase and challengePhrase and challengePhrase.strip():
-            expected_phrase = challengePhrase.strip()
-            attempt_tracker.set_challenge(sessionId, expected_phrase, language=lang_code)
-        if not expected_phrase:
-            if settings.DEBUG and sessionId and sessionId.startswith("test-session"):
+        # Validate challenge attempt (enforce server-stored phrase, short expiration, and one-time use)
+        valid_attempt, reason_code, attempt_info = attempt_tracker.validate_attempt(sessionId)
+        if not valid_attempt:
+            # Check if this is a direct test call without /challenge/new
+            if reason_code == "MISSING_CHALLENGE" and challengePhrase and challengePhrase.strip():
+                expected_phrase = challengePhrase.strip()
+                attempt_tracker.set_challenge(sessionId, expected_phrase, language=lang_code)
+                attempt_info = attempt_tracker.get_challenge_record(sessionId)
+            elif reason_code == "MISSING_CHALLENGE" and settings.DEBUG and sessionId and sessionId.startswith("test-session"):
                 expected_phrase = "test phrase"
+                attempt_info = {"attempt_id": f"att-{sessionId}", "challenge": expected_phrase, "language": lang_code}
             else:
-                logger.warning(f"Session {sessionId} - Challenge phrase not initialized.")
+                if reason_code == "CHALLENGE_EXPIRED":
+                    err_msg = "Challenge phrase has expired. Please fetch a new challenge."
+                elif reason_code == "CHALLENGE_ALREADY_USED":
+                    err_msg = "This challenge phrase has already been verified (replay detected). Please fetch a new challenge."
+                else:
+                    err_msg = "Challenge phrase not initialized for this session. Please fetch a challenge first."
+                logger.warning(f"Session {sessionId} - Attempt validation failed: {reason_code}")
                 return JSONResponse(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     content={
                         "success": False,
                         "error": {
-                            "code": "MISSING_CHALLENGE",
-                            "message": "Challenge phrase not initialized for this session. Please fetch a challenge first."
+                            "code": reason_code,
+                            "message": err_msg
                         }
                     }
                 )
+        else:
+            # Server-stored expected phrase is authoritative! Frontend cannot change it after recording starts.
+            expected_phrase = attempt_info.get("challenge")
+            lang_code = attempt_info.get("language") or lang_code
+
+        # Attempt ID for tracking
+        resolved_attempt_id = attemptId or attempt_info.get("attempt_id") or sessionId
 
         # Run Whisper transcription
         try:
@@ -445,19 +464,52 @@ async def sync_lip_voice(
             else:
                 rejection_reason = "Liveness verification criteria not satisfied."
 
-        # Log sync evaluation variables
+        # Diagnostic Logs for each verification check
+        logger.info(f"========== [DIAGNOSTIC LOGS - SESSION {sessionId} (LANG={lang_code})] ==========")
         logger.info(
-            f"Session {sessionId} (lang={lang_code}) - Sync evaluation success. "
-            f"ProcessingTime={processing_time_ms}ms, AudioDuration={audio_duration_ms}ms, "
-            f"LipDuration={lip_duration_ms}ms, Diff={duration_diff_ms}ms, "
-            f"EffectiveThreshold={effective_threshold:.2f} (Adaptive={adaptive_used}), "
-            f"Status={final_status}, Reason={rejection_reason or 'None'}"
+            f"[CHECK: TRANSCRIPTION] Expected='{expected_phrase}' | "
+            f"Transcribed='{recognized_text}' | "
+            f"CharSim={verification.get('characterSimilarityPercentage', 0.0):.1f}% | "
+            f"WordMatch={verification.get('wordMatchPercentage', 0.0):.1f}% | "
+            f"WhisperConfidence={whisper_confidence:.3f} | "
+            f"OverallScore={verification.get('overallScore', 0.0):.1f}% | "
+            f"Status={verification.get('verificationStatus')} | "
+            f"Reason={verification.get('verificationReason')}"
         )
+        logger.info(
+            f"[CHECK: LIP_MOVEMENT] Frames={len(lip_movement)} | "
+            f"Variance={metrics.get('lipVariance', 0.0):.6f} | "
+            f"MinVariance={settings.MIN_LIP_VARIATION:.6f} | "
+            f"IsMoving={metrics.get('isLipMoving', False)}"
+        )
+        logger.info(
+            f"[CHECK: DURATION] AudioDuration={audio_duration_ms}ms | "
+            f"LipDuration={lip_duration_ms}ms | "
+            f"Diff={duration_diff_ms}ms | "
+            f"MaxDiffAllowed={settings.MAX_SYNC_TIME_DIFF_MS:.0f}ms | "
+            f"DurationMatch={not duration_mismatch}"
+        )
+        logger.info(
+            f"[CHECK: SYNCHRONIZATION] RawCorrelation={metrics.get('rawCorrelation', 0.0):.3f} | "
+            f"AlignedCorrelation={metrics.get('alignedCorrelation', 0.0):.3f} | "
+            f"RequiredThreshold={effective_threshold:.3f} (Adaptive={adaptive_used}) | "
+            f"Offset={metrics.get('detectedTimeOffsetMs', 0.0):+.1f}ms | "
+            f"MaxOffsetAllowed=±{settings.MAX_SYNC_TIME_DIFF_MS:.0f}ms | "
+            f"SyncStatus={metrics.get('syncStatus')} | "
+            f"Reason={metrics.get('syncReason')}"
+        )
+        logger.info(
+            f"[DECISION: FINAL] Result={final_status} | "
+            f"ProcessingTime={processing_time_ms}ms | "
+            f"RejectionReason={rejection_reason or 'None (Verified Genuine Live Attempt)'}"
+        )
+        logger.info(f"================================================================================")
 
         resolved_user_id = (userId and userId.strip()) or sessionId
 
         attempt_data = {
             "sessionId": sessionId,
+            "attemptId": resolved_attempt_id,
             "userId": resolved_user_id,
             "language": lang_code,
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -505,14 +557,26 @@ async def sync_lip_voice(
         
         db_log_id = mongodb_service.log_verification_attempt(attempt_data)
 
+        # Consume challenge attempt so it cannot be replayed
+        attempt_tracker.consume_attempt(sessionId)
+        attempt_tracker.record_result(sessionId, final_status)
+        attempts_used = attempt_tracker.get_attempts(sessionId)
+        attempts_remaining = max(0, limit - attempts_used)
+        is_session_expired = (attempts_used >= limit and final_status != "LIVE")
+
         return {
             "success": True,
             "sessionId": sessionId,
+            "attemptId": resolved_attempt_id,
             "userId": resolved_user_id,
             "language": lang_code,
             "dbLogId": db_log_id,
             "livenessResult": final_status,
             "finalStatus": final_status,
+            "attemptsUsed": attempts_used,
+            "attemptsRemaining": attempts_remaining,
+            "maxAttempts": limit,
+            "isSessionExpired": is_session_expired,
             "syncStatus": metrics.get("syncStatus"),
             "rejectionReason": rejection_reason,
             "isLipMoving": metrics.get("isLipMoving", True),

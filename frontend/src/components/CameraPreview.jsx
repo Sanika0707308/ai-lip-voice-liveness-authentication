@@ -7,6 +7,8 @@ import {
   startNewCalibration,
   uploadCalibrationSample
 } from '../utils/api';
+import MonitoringPanel from './MonitoringPanel';
+
 
 // Day 16 additions: Configurable constants for Lip-Voice Synchronization Engine
 const MIN_SYNC_SAMPLES = 15;
@@ -109,7 +111,8 @@ const SHOW_LIP_LANDMARKS = true;
 const LIP_OUTER_COLOR = "#0D9488"; // Secondary Accent (Teal)
 const LIP_INNER_COLOR = "#2563EB"; // Primary Brand (Blue)
 const LANDMARK_RADIUS = 2;
-const MAX_NUM_FACES = 1;
+const MAX_NUM_FACES = 4; // LIVESCAN 2.0: Multi-person tracking up to 4 individuals
+
 
 // Lip landmark indices mapping the full concentric contours in MediaPipe Face Mesh
 const OUTER_LIP_INDICES = [61, 185, 40, 39, 37, 0, 267, 269, 270, 409, 291, 375, 321, 405, 314, 17, 84, 181, 91, 146];
@@ -350,7 +353,13 @@ const processSync = (lipSamples, audioSamples, threshold, currentHistory, option
  * Manages camera feed lifecycle, runs real-time MediaPipe Face Mesh detection,
  * draws canvas landmark overlays, and calculates real-time FPS.
  */
-function CameraPreview() {
+function CameraPreview({ onSessionStatusChange }) {
+  // LIVESCAN 2.0 Mode Tab: 'monitoring' | 'verification'
+  const [activeModeTab, setActiveModeTab] = useState('monitoring');
+  const [multiPersonCount, setMultiPersonCount] = useState(1);
+  const [monitoringSessionId, setMonitoringSessionId] = useState(() => generateSessionId());
+
+
   // State to track webcam status
   // Options: 'off' | 'requesting' | 'active' | 'denied' | 'unavailable' | 'unsupported'
   const [status, setStatus] = useState('off');
@@ -361,6 +370,7 @@ function CameraPreview() {
   // Day 11 additions: Detection status, canvas, and FPS tracking states
   const [faceDetected, setFaceDetected] = useState(false);
   const [fps, setFps] = useState(0);
+
 
   // Day 13 additions: Real-time lip movement metrics state
   const [metrics, setMetrics] = useState({
@@ -780,7 +790,7 @@ function CameraPreview() {
       const phrase = serverChallenge.challengePhrase;
       setChallengePhrase(phrase);
       setDisplayedChallenge(phrase);
-      setChallengeId(null);
+      setChallengeId(serverChallenge.attemptId || null);
       setChallengeStatus("READY");
       resetVerificationStates();
       spokenPhraseRef.current = '';
@@ -1528,8 +1538,11 @@ function CameraPreview() {
       }
 
       // 2. Track detection status state
-      const hasFace = results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0;
+      const detectedFacesCount = results.multiFaceLandmarks ? results.multiFaceLandmarks.length : 0;
+      setMultiPersonCount(detectedFacesCount);
+      const hasFace = detectedFacesCount > 0;
       setFaceDetected(hasFace);
+
 
       // 3. Process metrics and update rolling buffer
       let currentFrameRatio = 0;
@@ -1706,8 +1719,40 @@ function CameraPreview() {
             drawKeyLandmark(xRight, yRight, '#f5af19');
           }
         }
+
+        // LIVESCAN 2.0: Highlight additional detected persons with warning boundary boxes
+        if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 1) {
+          for (let f = 1; f < results.multiFaceLandmarks.length; f++) {
+            const secLandmarks = results.multiFaceLandmarks[f];
+            let minX = 1, minY = 1, maxX = 0, maxY = 0;
+            for (let i = 0; i < secLandmarks.length; i++) {
+              const lm = secLandmarks[i];
+              if (lm.x < minX) minX = lm.x;
+              if (lm.x > maxX) maxX = lm.x;
+              if (lm.y < minY) minY = lm.y;
+              if (lm.y > maxY) maxY = lm.y;
+            }
+            const bx = Math.max(0, minX * canvas.width - 10);
+            const by = Math.max(0, minY * canvas.height - 10);
+            const bw = Math.min(canvas.width - bx, (maxX - minX) * canvas.width + 20);
+            const bh = Math.min(canvas.height - by, (maxY - minY) * canvas.height + 20);
+
+            ctx.strokeStyle = '#EF4444';
+            ctx.lineWidth = 2.5;
+            ctx.setLineDash([5, 4]);
+            ctx.strokeRect(bx, by, bw, bh);
+            ctx.setLineDash([]);
+
+            ctx.fillStyle = '#EF4444';
+            ctx.fillRect(bx, Math.max(0, by - 20), 135, 20);
+            ctx.fillStyle = '#FFFFFF';
+            ctx.font = 'bold 10.5px sans-serif';
+            ctx.fillText(`⚠️ Person #${f + 1} Detected`, bx + 5, Math.max(14, by - 5));
+          }
+        }
       }
     });
+
 
     faceMeshRef.current = faceMesh;
     return faceMesh;
@@ -2411,8 +2456,35 @@ function CameraPreview() {
 
   return (
     <div className="camera-box-container">
+      {/* LIVESCAN 2.0 Mode Navigation Bar: Switch between Monitoring and Verification Modes */}
+      <div className="livescan-nav-bar">
+        <div className="livescan-nav-tabs">
+          <button
+            type="button"
+            className={`livescan-tab-item ${activeModeTab === 'monitoring' ? 'active' : ''}`}
+            onClick={() => setActiveModeTab('monitoring')}
+          >
+            <span className="tab-icon">📹</span>
+            <span className="tab-text">Online Assessment & Interview Monitoring</span>
+            {multiPersonCount > 1 && <span className="tab-alert-badge">⚠️ {multiPersonCount} People</span>}
+          </button>
+          <button
+            type="button"
+            className={`livescan-tab-item ${activeModeTab === 'verification' ? 'active' : ''}`}
+            onClick={() => setActiveModeTab('verification')}
+          >
+            <span className="tab-icon">🛡️</span>
+            <span className="tab-text">Dynamic Challenge Liveness Verification</span>
+            {finalResult && (
+              <span className={`tab-result-badge badge-${finalResult.toLowerCase()}`}>{finalResult}</span>
+            )}
+          </button>
+        </div>
+      </div>
+
       {/* 0. Multilingual Challenge-Response Selector Bar */}
       <div className="language-selector-bar">
+
         <div className="language-selector-label-group">
           <span className="language-selector-icon">🌐</span>
           <span className="language-selector-title">Challenge Language:</span>
@@ -2521,6 +2593,14 @@ function CameraPreview() {
                   className="camera-canvas"
                 />
               )}
+
+              {/* LIVESCAN 2.0 Floating Multi-Person Warning Badge */}
+              {status === 'active' && multiPersonCount > 1 && (
+                <div className="camera-overlay-multi-alert">
+                  <span className="blink-dot"></span> ⚠️ {multiPersonCount} People in Frame (Warning)
+                </div>
+              )}
+
 
               {/* Offline Placeholder */}
               {status === 'off' && !phraseVerificationLoading && (
@@ -2717,9 +2797,33 @@ function CameraPreview() {
           )}
         </div>
 
-        {/* Right Column: Verification Panel & Controls */}
-        <div className="col-verification">
-          {/* CASE A: Verification Result Summary (When Verification Completes) */}
+        {/* Right Column: Switch between Monitoring and Verification views */}
+        {activeModeTab === 'monitoring' ? (
+          <div className="col-monitoring-full">
+            <MonitoringPanel
+              videoRef={videoRef}
+              streamRef={streamRef}
+              sessionId={monitoringSessionId}
+              language={selectedLanguage}
+
+              latestLivenessResult={
+                finalResult
+                  ? {
+                      livenessResult: finalResult,
+                      synchronizationScore: finalSummary?.backendSyncResult?.alignedCorrelation ?? finalSummary?.averageScore,
+                      detectedTimeOffsetMs: finalSummary?.backendSyncResult?.detectedTimeOffsetMs,
+                      reason: finalSummary?.verificationReason
+                    }
+                  : null
+              }
+              onSessionStatusChange={onSessionStatusChange}
+              clientDetectedPersonCount={multiPersonCount}
+            />
+          </div>
+        ) : (
+          <div className="col-verification">
+            {/* CASE A: Verification Result Summary (When Verification Completes) */}
+
           {showSummaryCard && finalSummary && (
             <div className="summary-card-container">
               <div className="summary-card-header">
@@ -3416,8 +3520,10 @@ function CameraPreview() {
             </div>
           </div>
         </div>
+        )}
       </div>
     </div>
+
   );
 }
 

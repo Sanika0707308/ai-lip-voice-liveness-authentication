@@ -44,8 +44,8 @@ def test_pipeline():
     assert data["success"] is True
     phrase = data["challengePhrase"]
     parts = phrase.split()
-    assert len(parts) >= 4, f"Phrase should have at least 4 tokens: '{phrase}'"
-    assert parts[-1].isdigit() and len(parts[-1]) in [3, 4], f"Last token should be 3-4 digits: '{parts[-1]}'"
+    assert 4 <= len(parts) <= 7, f"Phrase should have 4 to 7 words: '{phrase}'"
+    assert not any(ch.isdigit() for ch in phrase), f"Phrase must not contain digits: '{phrase}'"
     print(f"[PASS] 1. Dynamic Challenge Generated: '{phrase}' (Session: {session_id})")
     passed_tests += 1
 

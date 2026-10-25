@@ -44,86 +44,53 @@ def get_audio_duration_seconds(filepath: str) -> float:
             pass
     return -1.0
 
-# Word pools for dynamic phrase generation (English - default)
-ADJECTIVES = ["blue", "green", "red", "yellow", "white", "black", "quick", "lazy", "bright", "dark", "warm", "cold", "silent", "loud", "heavy", "light"]
-NOUNS = ["tiger", "apple", "cloud", "bird", "river", "mountain", "forest", "shadow", "sun", "moon", "star", "wind", "rain", "ocean", "tree", "flower"]
-VERBS = ["runs", "shines", "moves", "flies", "sleeps", "walks", "sings", "dances", "grows", "falls", "rises", "flows", "glows", "leaps", "stands", "hides"]
-
-# Word pools for dynamic phrase generation (Hindi - 'hi')
-HI_ADJECTIVES = ["नीला", "हरा", "लाल", "पीला", "सफेद", "काला", "तेज", "शांत", "चमकीला", "गर्म", "ठंडा", "सुंदर", "बड़ा", "छोटा", "नया", "साफ"]
-HI_NOUNS = ["बाघ", "कमल", "बादल", "पक्षी", "नदी", "पर्वत", "जंगल", "सूरज", "चांद", "तारा", "हवा", "बारिश", "सागर", "पेड़", "फूल", "आकाश"]
-HI_VERBS = ["दौड़ता", "चमकता", "चलता", "उड़ता", "गाता", "नाचता", "बढ़ता", "बहता", "खिलता", "दिखता", "आता", "जाता", "बोलता", "खेलता", "रुकता", "हंसता"]
-HI_NUMBERS = ["शून्य", "एक", "दो", "तीन", "चार", "पांच", "छह", "सात", "आठ", "नौ"]
-
-# Word pools for dynamic phrase generation (Marathi - 'mr')
-MR_ADJECTIVES = ["निळा", "हिरवा", "लाल", "पिवळा", "पांढरा", "काळा", "वेगवान", "शांत", "तेजस्वी", "उबदार", "थंड", "सुंदर", "मोठा", "लहान", "नवीन", "स्वच्छ"]
-MR_NOUNS = ["वाघ", "कमळ", "ढग", "पक्षी", "नदी", "डोंगर", "जंगल", "सूर्य", "चंद्र", "तारा", "वारा", "पाऊस", "सागर", "झाड", "फूल", "आकाश"]
-MR_VERBS = ["धावतो", "चमकतो", "चालतो", "उडतो", "गातो", "नाचतो", "वाढतो", "वाहतो", "फुलतो", "दिसतो", "येतो", "जातो", "बोलतो", "खेळतो", "थांबतो", "हसतो"]
-MR_NUMBERS = ["शून्य", "एक", "दोन", "तीन", "चार", "पाच", "सहा", "सात", "आठ", "नऊ"]
-
-def generate_random_challenge(language: str = "en") -> str:
-    """
-    Generates a dynamic random challenge phrase in the requested language ('en', 'hi', 'mr'):
-    - English ('en'): 3 to 4 random words (adjective, noun, verb, optional 4th word) + 3-4 digit number.
-    - Hindi ('hi'): 2 to 3 natural Hindi words + 3 random Hindi number words (Devanagari).
-    - Marathi ('mr'): 2 to 3 natural Marathi words + 3 random Marathi number words (Devanagari).
-    """
-    lang_code = normalize_language_code(language)
-
-    if lang_code == "hi":
-        words = [
-            random.choice(HI_ADJECTIVES),
-            random.choice(HI_NOUNS),
-        ]
-        if random.choice([True, False]):
-            words.append(random.choice(HI_VERBS))
-        num_words = [random.choice(HI_NUMBERS) for _ in range(3)]
-        return f"{' '.join(words)} {' '.join(num_words)}"
-
-    if lang_code == "mr":
-        words = [
-            random.choice(MR_ADJECTIVES),
-            random.choice(MR_NOUNS),
-        ]
-        if random.choice([True, False]):
-            words.append(random.choice(MR_VERBS))
-        num_words = [random.choice(MR_NUMBERS) for _ in range(3)]
-        return f"{' '.join(words)} {' '.join(num_words)}"
-
-    # Default English ('en') - preserved identically
-    words = [
-        random.choice(ADJECTIVES),
-        random.choice(NOUNS),
-        random.choice(VERBS)
-    ]
-    # 50% chance to add a 4th random word
-    if random.choice([True, False]):
-        pool = ADJECTIVES + NOUNS + VERBS
-        words.append(random.choice(pool))
-        
-    number = random.randint(100, 9999)
-    return f"{' '.join(words)} {number}"
+from backend.services.challenge_service import (
+    ADJECTIVES,
+    NOUNS,
+    VERBS,
+    HI_ADJECTIVES,
+    HI_NOUNS,
+    HI_VERBS,
+    HI_NUMBERS,
+    MR_ADJECTIVES,
+    MR_NOUNS,
+    MR_VERBS,
+    MR_NUMBERS,
+    generate_random_challenge,
+    challenge_service
+)
 
 @router.get("/transcribe/challenge/new", tags=["Transcription Operations"])
 async def get_new_challenge(sessionId: str, language: str = "en"):
     """
-    Generates a dynamic random challenge phrase in the selected language ('en', 'hi', 'mr'),
-    maps it to the session, and returns it to the client.
+    Generates a dynamic grammatical challenge phrase in the selected language ('en', 'hi', 'mr'),
+    maps it to the session with a unique attempt ID and short expiration, and returns it to the client.
     """
     if not sessionId or not sessionId.strip():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Missing session ID."
         )
+
+    limit = settings.MAX_VERIFICATION_ATTEMPTS
+    if attempt_tracker.is_session_expired(sessionId, limit):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Verification session expired. Maximum {limit} attempts exceeded."
+        )
     
     lang_code = normalize_language_code(language)
-    phrase = generate_random_challenge(language=lang_code)
-    attempt_tracker.set_challenge(sessionId, phrase, language=lang_code)
+    phrase, attempt_id, ttl_seconds = challenge_service.generate_and_track_challenge(
+        session_id=sessionId,
+        language=lang_code
+    )
     return {
         "success": True,
         "sessionId": sessionId,
+        "attemptId": attempt_id,
         "language": lang_code,
-        "challengePhrase": phrase
+        "challengePhrase": phrase,
+        "expiresInSeconds": ttl_seconds
     }
 
 @router.post("/transcribe", tags=["Transcription Operations"])
@@ -250,10 +217,14 @@ async def transcribe_audio(
         whisper_confidence = result.get("confidence", 0.0)
 
         # 6. Verify Phrase
+        # Prioritize server-stored expected phrase if available to prevent client tampering
+        stored_phrase = attempt_tracker.get_challenge(sessionId)
+        active_expected_phrase = stored_phrase if (stored_phrase and stored_phrase.strip()) else challengePhrase
+
         start_verify = time.time()
         verification = VerificationEngine.verify(
             session_id=sessionId,
-            expected_phrase=challengePhrase,
+            expected_phrase=active_expected_phrase,
             recognized_text=recognized_text,
             whisper_confidence=whisper_confidence,
             language=lang_code
@@ -281,14 +252,14 @@ async def transcribe_audio(
             "verificationTimeMs": verification_time_ms,
             "speechStartTimeMs": speech_start_ms,
             "speechEndTimeMs": speech_end_ms,
-            "expectedPhrase": challengePhrase,
+            "expectedPhrase": active_expected_phrase,
             "recognizedText": recognized_text,
-            "generatedChallenge": challengePhrase,
+            "generatedChallenge": active_expected_phrase,
             "transcribedChallenge": recognized_text,
             "challengeMatchResult": verification["verificationStatus"],
             "whisperVerification": {
                 "language": lang_code,
-                "expectedPhrase": challengePhrase,
+                "expectedPhrase": active_expected_phrase,
                 "recognizedText": recognized_text,
                 "characterSimilarityPercentage": verification["characterSimilarityPercentage"],
                 "wordMatchPercentage": verification["wordMatchPercentage"],
@@ -307,7 +278,7 @@ async def transcribe_audio(
             "sessionId": sessionId,
             "language": lang_code,
             "dbLogId": db_log_id,
-            "expectedPhrase": challengePhrase,
+            "expectedPhrase": active_expected_phrase,
             "recognizedText": recognized_text,
             "characterSimilarityPercentage": verification["characterSimilarityPercentage"],
             "wordMatchPercentage": verification["wordMatchPercentage"],

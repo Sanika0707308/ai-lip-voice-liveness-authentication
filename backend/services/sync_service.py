@@ -100,31 +100,54 @@ class SyncService:
             
         return np.array(energy_envelope)
 
-    def cross_correlation_with_lag(self, x: np.ndarray, y: np.ndarray, max_lag: int, min_energy: float) -> tuple:
+    def cross_correlation_with_lag(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        max_lag: int,
+        min_energy: float = 0.02,
+        avg_dt: float = 33.33,
+        max_allowed_offset_ms: float = 500.0,
+        effective_threshold: float = 0.45
+    ) -> tuple:
         """
         Searches for the best cross-correlation alignment over the lag indices,
-        filtering out silent audio regions. Returns (rawCorrelation, alignedCorrelation, bestLagIndices).
+        preventing sample-starved edge artifacts from overriding valid in-window alignments.
+        Returns (rawCorrelation, alignedCorrelation, bestLagIndices).
         """
         n = len(x)
-        # Filter mask for non-silent audio frames (at lag = 0)
+        if n < 2:
+            return 0.0, 0.0, 0
+
         valid_mask = y >= min_energy
-        
+
         # Calculate raw correlation (lag = 0)
-        if np.sum(valid_mask) < 2:
-            raw_corr = 0.0
-        else:
-            raw_corr = np.corrcoef(x[valid_mask], y[valid_mask])[0, 1]
-            if np.isnan(raw_corr):
-                raw_corr = 0.0
-                
+        c_full = np.corrcoef(x, y)[0, 1] if n >= 2 else 0.0
+        c_full = 0.0 if np.isnan(c_full) else float(c_full)
+
+        c_speech = 0.0
+        if np.sum(valid_mask) >= 2:
+            cs = np.corrcoef(x[valid_mask], y[valid_mask])[0, 1]
+            if not np.isnan(cs):
+                c_speech = float(cs)
+
+        raw_corr = float(max(c_full, c_speech))
+
         best_corr = raw_corr
         best_lag = 0
-        
+
+        best_in_window_corr = raw_corr
+        best_in_window_lag = 0
+
+        # Minimum overlapping frames required to avoid spurious small-sample correlations
+        min_overlap = max(settings.MIN_VALID_SYNC_FRAMES // 2, min(15, n // 3))
+        max_allowed_lag = int(round(max_allowed_offset_ms / avg_dt)) if avg_dt > 0 else max_lag
+
         # Iterate lag search
         for lag in range(-max_lag, max_lag + 1):
             if lag == 0:
                 continue
-            
+
             if lag > 0:
                 sub_x = x[lag:]
                 sub_y = y[:-lag]
@@ -134,14 +157,37 @@ class SyncService:
                 sub_x = x[:-abs_lag]
                 sub_y = y[abs_lag:]
                 sub_mask = valid_mask[abs_lag:]
-                
-            if len(sub_x) >= 2 and np.sum(sub_mask) >= 2:
-                corr = np.corrcoef(sub_x[sub_mask], sub_y[sub_mask])[0, 1]
-                if not np.isnan(corr) and corr > best_corr:
+
+            if len(sub_x) >= min_overlap:
+                cf = np.corrcoef(sub_x, sub_y)[0, 1]
+                cf = 0.0 if np.isnan(cf) else float(cf)
+
+                cs = 0.0
+                if np.sum(sub_mask) >= max(2, min_overlap // 2):
+                    cs_val = np.corrcoef(sub_x[sub_mask], sub_y[sub_mask])[0, 1]
+                    if not np.isnan(cs_val):
+                        cs = float(cs_val)
+
+                corr = max(cf, cs)
+
+                # Track best alignment within the permissible +/-500ms sync window
+                if abs(lag) <= max_allowed_lag:
+                    if corr > best_in_window_corr:
+                        best_in_window_corr = corr
+                        best_in_window_lag = lag
+
+                # Track overall best alignment (including out-of-window for detecting true lag spoofs)
+                if corr > best_corr:
                     best_corr = corr
                     best_lag = lag
-                    
-        return float(raw_corr), float(best_corr), best_lag
+
+        # If an in-window alignment meets or exceeds threshold and is not decisively beaten
+        # by a significantly stronger out-of-window peak (e.g. a true lag spoof with offset > 500ms),
+        # prioritize the in-window alignment to avoid edge noise artifacts.
+        if best_in_window_corr >= effective_threshold and (best_corr - best_in_window_corr < 0.10):
+            return float(raw_corr), float(best_in_window_corr), best_in_window_lag
+        else:
+            return float(raw_corr), float(best_corr), best_lag
 
     def calculate_sync_metrics(
         self,
@@ -195,13 +241,14 @@ class SyncService:
             # 4. Extract aligned audio envelope
             audio_envelope = self.calculate_audio_energy(audio_data, samplerate, lip_timestamps)
             
-            # 5. Apply moving average smoothing to lip values
+            # 5. Apply moving average smoothing to lip values and audio envelope
             lip_arr = np.array(lip_movement, dtype=float)
             smoothed_lip = self.smooth_signal(lip_arr, settings.SYNC_SMOOTHING_WINDOW)
+            smoothed_audio = self.smooth_signal(audio_envelope, settings.SYNC_SMOOTHING_WINDOW)
 
             # 6. Normalize visual and audio signals
             norm_lip = self.normalize_signal(smoothed_lip)
-            norm_audio = self.normalize_signal(audio_envelope)
+            norm_audio = self.normalize_signal(smoothed_audio)
 
             # 7. Count valid non-silent audio frames and ignored frames
             min_energy = settings.MIN_AUDIO_ENERGY
@@ -236,7 +283,7 @@ class SyncService:
                     "syncStatus": "SPOOF",
                     "syncReason": (
                         f"Insufficient or static lip movement detected (variance: {lip_variance:.6f} < "
-                        f"{settings.MIN_LIP_VARIATION}). Physical lip movement is required."
+                        f"{settings.MIN_LIP_VARIATION}). Active speech movement is required."
                     ),
                     "isSynchronized": False,
                     "globalThreshold": round(global_threshold, 4),
@@ -276,7 +323,13 @@ class SyncService:
             max_lag_indices = max(1, max_lag_indices)
 
             raw_corr, aligned_corr, best_lag = self.cross_correlation_with_lag(
-                norm_lip, norm_audio, max_lag_indices, min_energy
+                norm_lip,
+                norm_audio,
+                max_lag_indices,
+                min_energy,
+                avg_dt=avg_dt,
+                max_allowed_offset_ms=settings.MAX_SYNC_TIME_DIFF_MS,
+                effective_threshold=effective_threshold
             )
 
             # Map lag to time offset in milliseconds

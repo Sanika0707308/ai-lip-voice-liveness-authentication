@@ -217,9 +217,10 @@ async def detect_persons(
 
     # Auto-log events to MongoDB / fallback if debouncer triggers
     if debounce_res["should_alert"]:
+        alert_event_type = debounce_res.get("alert_type") or "ADDITIONAL_PERSON_DETECTED"
         mongodb_service.log_monitoring_event({
             "sessionId": sessionId,
-            "eventType": "ADDITIONAL_PERSON_DETECTED",
+            "eventType": alert_event_type,
             "severity": "WARNING",
             "details": debounce_res["message"],
             "metadata": {
@@ -249,6 +250,7 @@ async def detect_persons(
 
     logger.info(
         f"[MONITORING: FACE/PERSON] Session={sessionId} | RawCount={person_count} | Faces={len(faces)} | "
+        f"FaceStatus={debounce_res['face_status']} | Paused={debounce_res['interview_paused']} | "
         f"ConfirmedCount={debounce_res['confirmed_person_count']} | Lighting={lighting_cond} | "
         f"ShouldAlert={debounce_res['should_alert']} | WarningActive={debounce_res['is_warning_active']} | "
         f"TotalSessionWarnings={warning_count}/{settings.MAX_MONITORING_WARNINGS} | Expired={is_expired}"
@@ -259,10 +261,14 @@ async def detect_persons(
         "sessionId": sessionId,
         "personCount": person_count,
         "faceCount": len(faces),
+        "faceStatus": debounce_res.get("face_status", "NORMAL"),
+        "interviewPaused": debounce_res.get("interview_paused", False),
+        "graceSecondsRemaining": debounce_res.get("grace_seconds_remaining", 0.0),
         "isWarningActive": debounce_res["is_warning_active"],
         "shouldAlert": debounce_res["should_alert"],
         "shouldClear": debounce_res["should_clear"],
         "alertMessage": debounce_res["message"],
+        "alertType": debounce_res.get("alert_type"),
         "lightingCondition": lighting_cond,
         "detections": detections,
         "faces": faces,

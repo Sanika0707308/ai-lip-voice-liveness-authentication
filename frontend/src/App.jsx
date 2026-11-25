@@ -6,22 +6,44 @@ import InterviewDashboard from './components/InterviewDashboard';
 export default function App() {
   // Workflow stages: 'LOGIN' | 'LIVENESS' | 'INTERVIEW'
   const [workflowStage, setWorkflowStage] = useState('LOGIN');
-  const [candidateData, setCandidateData] = useState(null);
+  const [candidateData, setCandidateData] = useState(() => {
+    try {
+      const saved = localStorage.getItem('candidateData');
+      return saved ? JSON.parse(saved) : null;
+    } catch {
+      return null;
+    }
+  });
   const [activeMediaStream, setActiveMediaStream] = useState(null);
   const [sessionExpiredNotice, setSessionExpiredNotice] = useState(null);
 
   // 1. After successful login -> redirect to Liveness Verification
   const handleLoginSuccess = (candidateInfo) => {
     setCandidateData(candidateInfo);
+    try {
+      localStorage.setItem('candidateData', JSON.stringify(candidateInfo));
+    } catch {}
     setWorkflowStage('LIVENESS');
     setSessionExpiredNotice(null);
   };
 
-  // 2. After LIVE verification result -> automatically open Interview Dashboard
-  const handleVerificationSuccess = ({ stream }) => {
+  // 2. After LIVE verification result -> directly open Interview Dashboard
+  const handleVerificationSuccess = ({ stream, sessionId: verifiedSessionId, candidateData: verifiedData }) => {
     if (stream) {
       setActiveMediaStream(stream);
     }
+    const updatedCandidate = {
+      ...(candidateData || {}),
+      ...(verifiedData || {}),
+      sessionId: verifiedSessionId || candidateData?.sessionId || 'sess-' + Date.now(),
+      livenessVerified: true
+    };
+    setCandidateData(updatedCandidate);
+    try {
+      localStorage.setItem('candidateData', JSON.stringify(updatedCandidate));
+      localStorage.setItem('liveness_verified', 'true');
+      localStorage.setItem('liveness_session_id', updatedCandidate.sessionId);
+    } catch {}
     setWorkflowStage('INTERVIEW');
   };
 
@@ -35,6 +57,9 @@ export default function App() {
     setCandidateData(null);
     setActiveMediaStream(null);
     setSessionExpiredNotice(null);
+    try {
+      localStorage.removeItem('candidateData');
+    } catch {}
     setWorkflowStage('LOGIN');
   };
 
@@ -91,9 +116,16 @@ export default function App() {
             />
           )}
 
-          {workflowStage === 'INTERVIEW' && candidateData && (
+          {workflowStage === 'INTERVIEW' && (
             <InterviewDashboard
-              candidateData={candidateData}
+              candidateData={candidateData || {
+                candidateName: 'Candidate',
+                candidateEmail: 'candidate@example.com',
+                interviewRole: 'Software Specialist',
+                roleId: 'python',
+                language: 'en',
+                sessionId: 'sess-' + Date.now()
+              }}
               initialStream={activeMediaStream}
               onInterviewEnd={handleRestartSession}
             />

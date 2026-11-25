@@ -172,8 +172,9 @@ export const uploadAudioForSync = async (
   const matchedLang = candidateLangs.find(l => ['en', 'hi', 'mr'].includes(String(l).toLowerCase()));
   language = matchedLang ? matchedLang.toLowerCase() : (['hi', 'mr'].includes(language) ? language : 'en');
 
+  const audioExt = audioBlob?.type?.includes('ogg') ? 'ogg' : audioBlob?.type?.includes('mp4') ? 'mp4' : 'webm';
   const formData = new FormData();
-  formData.append('file', audioBlob, 'recording.webm');
+  formData.append('file', audioBlob, `recording.${audioExt}`);
   formData.append('lipMovement', JSON.stringify(lipMovement));
   formData.append('lipTimestamps', JSON.stringify(lipTimestamps));
   formData.append('sessionId', sessionId || '');
@@ -188,22 +189,45 @@ export const uploadAudioForSync = async (
     formData.append('attemptId', attemptId);
   }
 
-  const response = await fetch('/api/sync', {
-    method: 'POST',
-    body: formData,
-    signal: signal
-  });
+  // Enforce a 35-second timeout so the UI never hangs indefinitely during analysis
+  const timeoutController = new AbortController();
+  const timeoutId = setTimeout(() => {
+    timeoutController.abort();
+  }, 35000);
 
-  if (!response.ok) {
-    const errData = await response.json().catch(() => ({}));
-    const msg = errData.error?.message || errData.detail || `Server error: status ${response.status}`;
-    const error = new Error(msg);
-    error.status = response.status;
-    error.code = errData.error?.code;
-    throw error;
+  let activeSignal = timeoutController.signal;
+  if (signal) {
+    signal.addEventListener('abort', () => timeoutController.abort());
+    if (signal.aborted) timeoutController.abort();
   }
 
-  return response.json();
+  try {
+    const response = await fetch('/api/sync', {
+      method: 'POST',
+      body: formData,
+      signal: activeSignal
+    });
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      const errData = await response.json().catch(() => ({}));
+      const msg = errData.error?.message || errData.detail || `Server error: status ${response.status}`;
+      const error = new Error(msg);
+      error.status = response.status;
+      error.code = errData.error?.code;
+      throw error;
+    }
+
+    return response.json();
+  } catch (fetchErr) {
+    clearTimeout(timeoutId);
+    if (fetchErr.name === 'AbortError') {
+      const timeoutError = new Error('Verification request timed out. Please check your network and try again.');
+      timeoutError.status = 408;
+      throw timeoutError;
+    }
+    throw fetchErr;
+  }
 };
 
 /**
@@ -265,8 +289,9 @@ export const uploadCalibrationSample = async (
   requiredSamples = 3,
   language = 'en'
 ) => {
+  const audioExt = audioBlob?.type?.includes('ogg') ? 'ogg' : audioBlob?.type?.includes('mp4') ? 'mp4' : 'webm';
   const formData = new FormData();
-  formData.append('file', audioBlob, 'recording.webm');
+  formData.append('file', audioBlob, `recording.${audioExt}`);
   formData.append('lipMovement', JSON.stringify(lipMovement));
   formData.append('lipTimestamps', JSON.stringify(lipTimestamps));
   formData.append('sessionId', sessionId || '');
@@ -431,5 +456,128 @@ export const fetchSessionStatus = async (sessionId) => {
   }
   return response.json();
 };
+
+/**
+ * Initializes a role-based interview session with curated questions.
+ */
+export const initInterviewSession = async (
+  sessionId,
+  role = 'python',
+  experienceLevel = 'fresher',
+  language = 'en',
+  candidateName = 'Candidate',
+  candidateEmail = 'candidate@example.com',
+  skills = '',
+  customRole = '',
+  questionCount = 5
+) => {
+  const formData = new FormData();
+  formData.append('sessionId', sessionId);
+  formData.append('role', role);
+  formData.append('experienceLevel', experienceLevel);
+  formData.append('language', language);
+  formData.append('candidateName', candidateName);
+  formData.append('candidateEmail', candidateEmail);
+  if (skills) formData.append('skills', skills);
+  if (customRole) formData.append('customRole', customRole);
+  if (questionCount) formData.append('questionCount', String(questionCount));
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 6000);
+
+  try {
+    const response = await fetch('/api/interview/init', {
+      method: 'POST',
+      body: formData,
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      throw new Error(err.detail || 'Failed to initialize interview session.');
+    }
+    return response.json();
+  } catch (err) {
+    clearTimeout(timeoutId);
+    throw err;
+  }
+};
+
+/**
+ * Fetches current interview progression state and active question.
+ */
+export const fetchInterviewState = async (sessionId) => {
+  if (!sessionId) return null;
+  const response = await fetch(`/api/interview/${encodeURIComponent(sessionId)}/state`);
+  if (!response.ok) {
+    throw new Error('Failed to fetch interview state.');
+  }
+  return response.json();
+};
+
+export const transcribeAnswerAudio = async (audioBlob, language = 'en') => {
+  const formData = new FormData();
+  formData.append('audio', audioBlob, 'answer.webm');
+  formData.append('language', language);
+
+  const response = await fetch('/api/interview/transcribe-answer', {
+    method: 'POST',
+    body: formData
+  });
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to transcribe audio.');
+  }
+  return response.json();
+};
+
+/**
+ * Submits a candidate voice answer for Faster-Whisper transcription and rubric evaluation.
+ */
+export const submitInterviewAnswer = async (
+  sessionId,
+  questionIndex,
+  questionId,
+  audioBlob = null,
+  transcriptText = '',
+  language = 'en'
+) => {
+  const formData = new FormData();
+  formData.append('questionIndex', String(questionIndex));
+  formData.append('questionId', questionId);
+  formData.append('language', language);
+  if (transcriptText) {
+    formData.append('transcriptText', transcriptText);
+  }
+  if (audioBlob) {
+    formData.append('audioFile', audioBlob, 'candidate_answer.webm');
+  }
+
+  const response = await fetch(`/api/interview/${encodeURIComponent(sessionId)}/submit-answer`, {
+    method: 'POST',
+    body: formData
+  });
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to submit interview answer.');
+  }
+  return response.json();
+};
+
+/**
+ * Fetches complete interview assessment results, scores, and feedback.
+ */
+export const fetchInterviewResults = async (sessionId) => {
+  if (!sessionId) return null;
+  const response = await fetch(`/api/interview/${encodeURIComponent(sessionId)}/results`);
+  if (!response.ok) {
+    throw new Error('Failed to fetch interview results.');
+  }
+  return response.json();
+};
+
 
 

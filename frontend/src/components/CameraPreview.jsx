@@ -369,6 +369,7 @@ function CameraPreview({ onSessionStatusChange }) {
 
   // Day 11 additions: Detection status, canvas, and FPS tracking states
   const [faceDetected, setFaceDetected] = useState(false);
+  const [lipsDetected, setLipsDetected] = useState(false);
   const [fps, setFps] = useState(0);
 
 
@@ -1053,6 +1054,7 @@ function CameraPreview({ onSessionStatusChange }) {
     // 11. Set camera status to off
     setStatus('off');
     setFaceDetected(false);
+    setLipsDetected(false);
     setFps(0);
     fpsValuesRef.current = [];
     setMetrics({
@@ -1554,6 +1556,7 @@ function CameraPreview({ onSessionStatusChange }) {
         const pRight = landmarks[RIGHT_LIP_CORNER];
 
         if (pUpper && pLower && pLeft && pRight) {
+          setLipsDetected(true);
           const vDist = calculateDistance(pUpper, pLower);
           const hDist = calculateDistance(pLeft, pRight);
           const ratio = hDist > 0 ? (vDist / hDist) : 0;
@@ -1580,6 +1583,7 @@ function CameraPreview({ onSessionStatusChange }) {
             recordingLipTimestampsRef.current.push(elapsedMs);
           }
         } else {
+          setLipsDetected(false);
           setMetrics({
             verticalDistance: 0,
             horizontalDistance: 0,
@@ -1588,6 +1592,7 @@ function CameraPreview({ onSessionStatusChange }) {
           lipRatioBufferRef.current = [];
         }
       } else {
+        setLipsDetected(false);
         setMetrics({
           verticalDistance: 0,
           horizontalDistance: 0,
@@ -2525,9 +2530,9 @@ function CameraPreview({ onSessionStatusChange }) {
             <div className="camera-card-header">
               <div className="camera-card-header-left">
                 {status === 'active' ? (
-                  <div className={`detection-status-bar ${faceDetected ? 'detected' : 'not-detected'}`}>
+                  <div className={`detection-status-bar ${lipsDetected ? 'detected' : faceDetected ? 'pending' : 'not-detected'}`}>
                     <span className="detection-status-dot"></span>
-                    <span>{faceDetected ? 'Face Detected' : 'No Face Detected'}</span>
+                    <span>{lipsDetected ? 'Lips Detected' : faceDetected ? 'Face Aligned (Lips Not Detected)' : 'No Face Detected'}</span>
                   </div>
                 ) : (
                   <div className="detection-status-bar offline">

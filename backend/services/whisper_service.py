@@ -1,6 +1,15 @@
 import os
 import time
 import math
+import av
+
+# Compatibility fix: PyAV 14+ removed 'metadata_errors' parameter which faster-whisper passes in audio.py
+_orig_av_open = av.open
+def _safe_av_open(*args, **kwargs):
+    kwargs.pop('metadata_errors', None)
+    return _orig_av_open(*args, **kwargs)
+av.open = _safe_av_open
+
 from faster_whisper import WhisperModel
 from backend.config import settings
 from backend.services.verification_service import normalize_language_code, normalize_text
@@ -97,6 +106,8 @@ class WhisperService:
                     condition_on_previous_text=False
                 )
                 segments_list = list(segments)
+                if not segments_list:
+                    raise ValueError("Empty segments with vad_filter, falling back to full audio transcription")
             except Exception:
                 segments, info = active_model.transcribe(
                     audio_filepath,

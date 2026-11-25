@@ -74,29 +74,32 @@ class SyncService:
 
     def calculate_audio_energy(self, audio_data: np.ndarray, samplerate: int, lip_timestamps: list) -> np.ndarray:
         """
-        Extracts Root-Mean-Square (RMS) envelope scaled values aligned with visual timestamps.
+        Extracts Root-Mean-Square (RMS) envelope values aligned with visual timestamps,
+        integrating across dynamic inter-frame intervals so no speech audio is omitted.
         """
         energy_envelope = []
-        # Window size is 30ms representing standard video frame duration
-        window_size = int(0.030 * samplerate)
-        half_window = window_size // 2
         n_samples = len(audio_data)
+        n_frames = len(lip_timestamps)
+        if n_samples == 0 or n_frames == 0:
+            return np.zeros(n_frames, dtype=float)
 
-        for t_ms in lip_timestamps:
-            # Determine center sample index in raw audio for the relative timestamp
+        for i, t_ms in enumerate(lip_timestamps):
+            if i == 0:
+                dt_ms = (lip_timestamps[1] - lip_timestamps[0]) if n_frames > 1 else 33.33
+            else:
+                dt_ms = max(15.0, float(lip_timestamps[i] - lip_timestamps[i - 1]))
+            win_sec = max(0.030, dt_ms / 1000.0)
+            half_win = int((win_sec / 2.0) * samplerate)
             center_idx = int((t_ms / 1000.0) * samplerate)
-            start_idx = max(0, center_idx - half_window)
-            end_idx = min(n_samples, center_idx + half_window)
+            start_idx = max(0, center_idx - half_win)
+            end_idx = min(n_samples, center_idx + half_win)
             
             window = audio_data[start_idx:end_idx]
             if len(window) > 0:
-                rms = np.sqrt(np.mean(window ** 2))
+                rms = float(np.sqrt(np.mean(window ** 2)))
             else:
                 rms = 0.0
-            
-            # Map/Scale audio volume RMS to match the UI Live Volume Meter scaling
-            energy = min(rms * 4.0, 1.0)
-            energy_envelope.append(energy)
+            energy_envelope.append(rms)
             
         return np.array(energy_envelope)
 
@@ -105,46 +108,70 @@ class SyncService:
         x: np.ndarray,
         y: np.ndarray,
         max_lag: int,
-        min_energy: float = 0.02,
+        speech_mask: np.ndarray = None,
         avg_dt: float = 33.33,
         max_allowed_offset_ms: float = 500.0,
         effective_threshold: float = 0.45
     ) -> tuple:
         """
-        Searches for the best cross-correlation alignment over the lag indices,
-        preventing sample-starved edge artifacts from overriding valid in-window alignments.
+        Searches for the optimal cross-correlation alignment over the permissible sync window (<= 500ms),
+        evaluating speech-segment correlation, continuous speech window correlation, motion velocity correlation,
+        and full-window correlation.
         Returns (rawCorrelation, alignedCorrelation, bestLagIndices).
         """
         n = len(x)
         if n < 2:
             return 0.0, 0.0, 0
 
-        valid_mask = y >= min_energy
+        # Determine speech mask on normalized scale if not provided as boolean array
+        if speech_mask is None or len(speech_mask) != n:
+            valid_mask = y >= 0.15
+        elif isinstance(speech_mask, np.ndarray) and speech_mask.dtype == bool:
+            valid_mask = speech_mask
+        else:
+            valid_mask = np.array(speech_mask, dtype=bool)
 
-        # Calculate raw correlation (lag = 0)
-        c_full = np.corrcoef(x, y)[0, 1] if n >= 2 else 0.0
-        c_full = 0.0 if np.isnan(c_full) else float(c_full)
+        def _calc_corr(a: np.ndarray, b: np.ndarray) -> float:
+            if len(a) < 4:
+                return 0.0
+            sa, sb = float(np.std(a)), float(np.std(b))
+            if sa > 1e-6 and sb > 1e-6:
+                val = float(np.corrcoef(a, b)[0, 1])
+                return max(0.0, val) if not np.isnan(val) else 0.0
+            return 0.0
 
-        c_speech = 0.0
-        if np.sum(valid_mask) >= 2:
-            cs = np.corrcoef(x[valid_mask], y[valid_mask])[0, 1]
-            if not np.isnan(cs):
-                c_speech = float(cs)
+        def _eval_alignment(sub_x: np.ndarray, sub_y: np.ndarray, sub_mask: np.ndarray, min_frames: int) -> float:
+            if len(sub_x) < min_frames:
+                return 0.0
+            cf = _calc_corr(sub_x, sub_y)
+            cs = 0.0
+            if np.sum(sub_mask) >= max(4, min_frames // 2):
+                cs = _calc_corr(sub_x[sub_mask], sub_y[sub_mask])
+            cw = 0.0
+            speech_idx = np.where(sub_mask)[0]
+            if len(speech_idx) >= max(4, min_frames // 2):
+                ws = max(0, int(speech_idx[0]) - 4)
+                we = min(len(sub_x), int(speech_idx[-1]) + 5)
+                if we - ws >= 4:
+                    cw = _calc_corr(sub_x[ws:we], sub_y[ws:we])
+            cm = 0.0
+            if len(sub_x) >= 6:
+                cm = _calc_corr(np.abs(np.diff(sub_x)), np.abs(np.diff(sub_y)))
+            return float(max(cf, cs, cw, cm))
 
-        raw_corr = float(max(c_full, c_speech))
+        # Minimum overlapping frames required to ensure statistical significance
+        min_overlap = max(settings.MIN_VALID_SYNC_FRAMES // 2, min(12, n // 3))
+        max_allowed_lag = int(round(max_allowed_offset_ms / avg_dt)) if avg_dt > 0 else max_lag
+        search_lag = min(max_lag, max_allowed_lag)
+        search_lag = max(1, search_lag)
 
+        # Calculate raw correlation at lag = 0
+        raw_corr = _eval_alignment(x, y, valid_mask, min_overlap)
         best_corr = raw_corr
         best_lag = 0
 
-        best_in_window_corr = raw_corr
-        best_in_window_lag = 0
-
-        # Minimum overlapping frames required to avoid spurious small-sample correlations
-        min_overlap = max(settings.MIN_VALID_SYNC_FRAMES // 2, min(15, n // 3))
-        max_allowed_lag = int(round(max_allowed_offset_ms / avg_dt)) if avg_dt > 0 else max_lag
-
-        # Iterate lag search
-        for lag in range(-max_lag, max_lag + 1):
+        # Search optimal alignment within the allowable window
+        for lag in range(-search_lag, search_lag + 1):
             if lag == 0:
                 continue
 
@@ -158,36 +185,63 @@ class SyncService:
                 sub_y = y[abs_lag:]
                 sub_mask = valid_mask[abs_lag:]
 
-            if len(sub_x) >= min_overlap:
-                cf = np.corrcoef(sub_x, sub_y)[0, 1]
-                cf = 0.0 if np.isnan(cf) else float(cf)
+            corr = _eval_alignment(sub_x, sub_y, sub_mask, min_overlap)
+            if corr > best_corr:
+                best_corr = corr
+                best_lag = lag
 
-                cs = 0.0
-                if np.sum(sub_mask) >= max(2, min_overlap // 2):
-                    cs_val = np.corrcoef(sub_x[sub_mask], sub_y[sub_mask])[0, 1]
-                    if not np.isnan(cs_val):
-                        cs = float(cs_val)
+        return float(raw_corr), float(best_corr), int(best_lag)
 
-                corr = max(cf, cs)
+    def convert_to_wav(self, audio_filepath: str) -> tuple:
+        """
+        Converts source audio (WebM, Ogg, MP4, WAV, etc.) into a clean 16kHz mono
+        16-bit PCM WAV file via FFmpeg and returns (wav_path, audio_meta).
+        Caller is responsible for deleting wav_path.
+        """
+        temp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        temp_wav.close()  # Close so ffmpeg can write to it
+        temp_wav_path = temp_wav.name
 
-                # Track best alignment within the permissible +/-500ms sync window
-                if abs(lag) <= max_allowed_lag:
-                    if corr > best_in_window_corr:
-                        best_in_window_corr = corr
-                        best_in_window_lag = lag
-
-                # Track overall best alignment (including out-of-window for detecting true lag spoofs)
-                if corr > best_corr:
-                    best_corr = corr
-                    best_lag = lag
-
-        # If an in-window alignment meets or exceeds threshold and is not decisively beaten
-        # by a significantly stronger out-of-window peak (e.g. a true lag spoof with offset > 500ms),
-        # prioritize the in-window alignment to avoid edge noise artifacts.
-        if best_in_window_corr >= effective_threshold and (best_corr - best_in_window_corr < 0.10):
-            return float(raw_corr), float(best_in_window_corr), best_in_window_lag
-        else:
-            return float(raw_corr), float(best_corr), best_lag
+        cmd = [
+            "ffmpeg", "-y", "-i", audio_filepath,
+            "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+            temp_wav_path
+        ]
+        try:
+            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=30)
+            audio_data, samplerate = sf.read(temp_wav_path)
+            info = sf.info(temp_wav_path)
+            wav_bytes = os.path.getsize(temp_wav_path)
+            duration_ms = int(round(info.duration * 1000))
+            if audio_data.size > 0:
+                overall_rms = float(np.sqrt(np.mean(audio_data ** 2)))
+                peak_amp = float(np.max(np.abs(audio_data)))
+            else:
+                overall_rms = 0.0
+                peak_amp = 0.0
+            return temp_wav_path, {
+                "wavBytes": wav_bytes,
+                "sampleRate": int(samplerate),
+                "durationMs": duration_ms,
+                "overallRms": round(overall_rms, 6),
+                "peakAmplitude": round(peak_amp, 6),
+            }
+        except subprocess.TimeoutExpired as te:
+            if os.path.exists(temp_wav_path):
+                os.remove(temp_wav_path)
+            print(f"FFmpeg conversion timed out: {te}")
+            raise AudioProcessingError("Audio conversion timed out.")
+        except subprocess.CalledProcessError as cpe:
+            if os.path.exists(temp_wav_path):
+                os.remove(temp_wav_path)
+            stderr_output = cpe.stderr.decode('utf-8', errors='ignore') if cpe.stderr else ""
+            print(f"FFmpeg conversion failed: {cpe}. Stderr: {stderr_output}")
+            raise AudioProcessingError("Audio conversion failed or file is corrupted.")
+        except Exception as e:
+            if os.path.exists(temp_wav_path):
+                os.remove(temp_wav_path)
+            print(f"Error reading converted audio file: {e}")
+            raise AudioProcessingError("Failed to read converted audio file properties.")
 
     def calculate_sync_metrics(
         self,
@@ -198,7 +252,7 @@ class SyncService:
     ) -> Dict[str, Any]:
         """
         Runs the full Lip-Voice Synchronization pipeline and computes diagnostic metrics.
-        Converts the source audio to WAV first.
+        Converts source audio to 16kHz mono WAV when needed.
         """
         global_threshold = float(settings.LIVE_SYNC_THRESHOLD)
         if correlation_threshold is not None:
@@ -206,37 +260,23 @@ class SyncService:
         else:
             effective_threshold = global_threshold
 
-        temp_wav = None
+        owned_temp_wav = None
         try:
-            # 1. Create a thread-safe temporary file for WAV output
-            temp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            temp_wav.close()  # Close so ffmpeg can write to it
-            temp_wav_path = temp_wav.name
+            read_wav_path = None
+            if audio_filepath.lower().endswith(".wav"):
+                try:
+                    info = sf.info(audio_filepath)
+                    if info.samplerate == 16000 and info.channels == 1:
+                        read_wav_path = audio_filepath
+                        audio_duration_ms = int(round(info.duration * 1000))
+                        audio_data, samplerate = sf.read(read_wav_path)
+                except Exception:
+                    read_wav_path = None
 
-            # 2. Convert source audio to 16kHz mono WAV using ffmpeg with 30s timeout
-            cmd = [
-                "ffmpeg", "-y", "-i", audio_filepath,
-                "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
-                temp_wav_path
-            ]
-            try:
-                subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=30)
-            except subprocess.TimeoutExpired as te:
-                print(f"FFmpeg conversion timed out: {te}")
-                raise AudioProcessingError("Audio conversion timed out.")
-            except subprocess.CalledProcessError as cpe:
-                stderr_output = cpe.stderr.decode('utf-8', errors='ignore') if cpe.stderr else ""
-                print(f"FFmpeg conversion failed: {cpe}. Stderr: {stderr_output}")
-                raise AudioProcessingError("Audio conversion failed or file is corrupted.")
-
-            # 3. Read WAV file (16kHz mono format)
-            try:
-                audio_data, samplerate = sf.read(temp_wav_path)
-                info = sf.info(temp_wav_path)
-                audio_duration_ms = int(round(info.duration * 1000))
-            except Exception as e:
-                print(f"Error reading converted audio file: {e}")
-                raise AudioProcessingError("Failed to read converted audio file properties.")
+            if read_wav_path is None:
+                owned_temp_wav, wav_meta = self.convert_to_wav(audio_filepath)
+                audio_data, samplerate = sf.read(owned_temp_wav)
+                audio_duration_ms = wav_meta["durationMs"]
 
             # 4. Extract aligned audio envelope
             audio_envelope = self.calculate_audio_energy(audio_data, samplerate, lip_timestamps)
@@ -251,11 +291,13 @@ class SyncService:
             norm_audio = self.normalize_signal(smoothed_audio)
 
             # 7. Count valid non-silent audio frames and ignored frames
-            min_energy = settings.MIN_AUDIO_ENERGY
+            max_energy = float(np.max(audio_envelope)) if len(audio_envelope) > 0 else 0.0
+            avg_energy = float(np.mean(audio_envelope)) if len(audio_envelope) > 0 else 0.0
+            min_energy = max(0.015, min(settings.MIN_AUDIO_ENERGY, max_energy * 0.25))
+            effective_min_energy = min_energy
             valid_mask = audio_envelope >= min_energy
             valid_frames = int(np.sum(valid_mask))
             ignored_frames = len(lip_movement) - valid_frames
-            avg_energy = float(np.mean(audio_envelope)) if len(audio_envelope) > 0 else 0.0
 
             # Prepare time-aligned normalized signal series for frontend visualization
             t0 = float(lip_timestamps[0]) if len(lip_timestamps) > 0 else 0.0
@@ -278,6 +320,7 @@ class SyncService:
                     "validFrames": valid_frames,
                     "ignoredFrames": ignored_frames,
                     "averageAudioEnergy": avg_energy,
+                    "maxAudioEnergy": max_energy,
                     "lipVariance": round(lip_variance, 6),
                     "isLipMoving": False,
                     "syncStatus": "SPOOF",
@@ -292,8 +335,9 @@ class SyncService:
                     "signalSeries": signal_series
                 }
 
-            # 9. Check minimal frame threshold
-            if valid_frames < settings.MIN_VALID_SYNC_FRAMES:
+            # 9. Check minimal frame threshold and audio volume (Silence Rejection)
+            min_speech_frames = min(settings.MIN_VALID_SYNC_FRAMES, 15)
+            if valid_frames < min_speech_frames or max_energy < 0.025 or avg_energy < 0.006:
                 return {
                     "audioDurationMs": audio_duration_ms,
                     "rawCorrelation": 0.0,
@@ -302,10 +346,11 @@ class SyncService:
                     "validFrames": valid_frames,
                     "ignoredFrames": ignored_frames,
                     "averageAudioEnergy": avg_energy,
+                    "maxAudioEnergy": max_energy,
                     "lipVariance": round(lip_variance, 6),
                     "isLipMoving": True,
                     "syncStatus": "SPOOF",
-                    "syncReason": f"Insufficient speech audio frames ({valid_frames}/{settings.MIN_VALID_SYNC_FRAMES} required).",
+                    "syncReason": "No audible speech detected. Active vocal speech matching the challenge phrase is required.",
                     "isSynchronized": False,
                     "globalThreshold": round(global_threshold, 4),
                     "effectiveThreshold": round(effective_threshold, 4),
@@ -317,16 +362,15 @@ class SyncService:
             deltas = np.diff(lip_timestamps)
             avg_dt = float(np.mean(deltas)) if len(deltas) > 0 else 33.33
 
-            # 10. Cross-correlation with lag (search window up to 2x MAX_SYNC_TIME_DIFF_MS so offsets > 500ms can be detected)
-            search_lag_ms = max(settings.SYNC_MAX_LAG_MS * 2, int(settings.MAX_SYNC_TIME_DIFF_MS * 2))
-            max_lag_indices = int(round(search_lag_ms / avg_dt))
+            # 10. Cross-correlation with lag (search window bounded to permissible MAX_SYNC_TIME_DIFF_MS = 500ms)
+            max_lag_indices = int(round(settings.MAX_SYNC_TIME_DIFF_MS / avg_dt)) if avg_dt > 0 else 15
             max_lag_indices = max(1, max_lag_indices)
 
             raw_corr, aligned_corr, best_lag = self.cross_correlation_with_lag(
                 norm_lip,
                 norm_audio,
                 max_lag_indices,
-                min_energy,
+                speech_mask=valid_mask,
                 avg_dt=avg_dt,
                 max_allowed_offset_ms=settings.MAX_SYNC_TIME_DIFF_MS,
                 effective_threshold=effective_threshold
@@ -369,6 +413,7 @@ class SyncService:
                 "validFrames": valid_frames,
                 "ignoredFrames": ignored_frames,
                 "averageAudioEnergy": avg_energy,
+                "maxAudioEnergy": max_energy,
                 "lipVariance": round(lip_variance, 6),
                 "isLipMoving": True,
                 "syncStatus": status,
@@ -381,10 +426,10 @@ class SyncService:
             }
 
         finally:
-            # Clean up the temporary WAV file
-            if temp_wav and os.path.exists(temp_wav.name):
+            # Clean up the temporary WAV file created by convert_to_wav
+            if owned_temp_wav and os.path.exists(owned_temp_wav):
                 try:
-                    os.remove(temp_wav.name)
+                    os.remove(owned_temp_wav)
                 except Exception as cleanup_err:
                     print(f"Failed to delete temporary WAV file: {cleanup_err}")
 

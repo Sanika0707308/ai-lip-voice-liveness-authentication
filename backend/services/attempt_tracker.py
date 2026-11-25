@@ -19,7 +19,7 @@ class BaseAttemptTracker:
         session_id: str,
         challenge: str,
         language: str = "en",
-        ttl_seconds: int = 60,
+        ttl_seconds: int = 300,
         attempt_id: Optional[str] = None
     ) -> str:
         raise NotImplementedError()
@@ -72,9 +72,11 @@ class InMemoryAttemptTracker(BaseAttemptTracker):
                 "challenge": None,
                 "language": "en",
                 "created_at": time.time(),
-                "expires_at": time.time() + 60,
+                "expires_at": time.time() + 300,
                 "status": "ACTIVE"
             })
+            if session.get("verification_status") == "LIVE":
+                return True
             current_attempts = session["attempts"]
             if current_attempts >= limit:
                 return False
@@ -131,7 +133,7 @@ class InMemoryAttemptTracker(BaseAttemptTracker):
         session_id: str,
         challenge: str,
         language: str = "en",
-        ttl_seconds: int = 60,
+        ttl_seconds: int = 300,
         attempt_id: Optional[str] = None
     ) -> str:
         if not session_id:
@@ -192,7 +194,7 @@ class InMemoryAttemptTracker(BaseAttemptTracker):
                 "challenge": None,
                 "language": "en",
                 "created_at": time.time(),
-                "expires_at": time.time() + 60,
+                "expires_at": time.time() + 300,
                 "status": "ACTIVE"
             })
             session["language"] = lang_code

@@ -33,6 +33,7 @@ class MongoDBService:
         self.calibration_collection = None
         self.monitoring_sessions_collection = None
         self.monitoring_events_collection = None
+        self.interview_answers_collection = None
         self._last_connect_attempt = 0.0
         self._reconnect_cooldown_sec = 5.0
         # Create temp folder path for fallback logs and calibration profiles
@@ -42,6 +43,7 @@ class MongoDBService:
         self.fallback_calibration_filepath = os.path.join(self.fallback_dir, "db_fallback_calibrations.jsonl")
         self.fallback_sessions_filepath = os.path.join(self.fallback_dir, "db_fallback_monitoring_sessions.jsonl")
         self.fallback_events_filepath = os.path.join(self.fallback_dir, "db_fallback_monitoring_events.jsonl")
+        self.fallback_answers_filepath = os.path.join(self.fallback_dir, "db_fallback_interview_answers.jsonl")
         self._try_connect(force=True)
 
     def _try_connect(self, force: bool = False) -> bool:
@@ -68,6 +70,7 @@ class MongoDBService:
             self.calibration_collection = self.db["calibration_profiles"]
             self.monitoring_sessions_collection = self.db["monitoring_sessions"]
             self.monitoring_events_collection = self.db["monitoring_events"]
+            self.interview_answers_collection = self.db["interview_answers"]
             
             # Create indexing for audit retrieval performance
             self.logs_collection.create_index([("userId", pymongo.ASCENDING)])
@@ -83,6 +86,9 @@ class MongoDBService:
             self.monitoring_sessions_collection.create_index([("startTime", pymongo.DESCENDING)])
             self.monitoring_events_collection.create_index([("sessionId", pymongo.ASCENDING)])
             self.monitoring_events_collection.create_index([("timestamp", pymongo.DESCENDING)])
+
+            # Create indexing for interview questions & answers
+            self.interview_answers_collection.create_index([("sessionId", pymongo.ASCENDING), ("questionIndex", pymongo.ASCENDING)])
             
             self.use_fallback = False
             logger.info("Successfully connected to MongoDB database and initialized collection indexes.")
@@ -615,12 +621,19 @@ class MongoDBService:
         is_expired = (warning_count >= settings.MAX_MONITORING_WARNINGS or "TERMINATED" in session_doc.get("status", ""))
         stop_reason = session_doc.get("stopReason") or ("Exceeded maximum integrity warnings" if is_expired else "Normal completion")
 
+        interview_answers = self.get_interview_answers(session_id)
+        overall_interview_score = 0.0
+        if interview_answers:
+            total_sc = sum(a.get("evaluation", {}).get("score", 0.0) for a in interview_answers)
+            overall_interview_score = round(total_sc / len(interview_answers), 1)
+
         report = {
             "sessionId": session_id,
             "status": session_doc.get("status", "TERMINATED_EXCESSIVE_WARNINGS" if is_expired else "COMPLETED"),
             "stopReason": stop_reason,
             "candidateId": session_doc.get("candidateId", "candidate"),
-            "interviewRole": session_doc.get("examId", "Candidate"),
+            "interviewRole": session_doc.get("interviewRole") or session_doc.get("examId", "Candidate"),
+            "experienceLevel": session_doc.get("experienceLevel", "Fresher"),
             "language": session_doc.get("language", "en"),
             "startTime": start_iso,
             "endTime": end_iso,
@@ -628,6 +641,8 @@ class MongoDBService:
             "warningCount": warning_count,
             "maxWarnings": settings.MAX_MONITORING_WARNINGS,
             "isSessionExpired": is_expired,
+            "overallInterviewScore": overall_interview_score,
+            "interviewAnswers": interview_answers,
             "summary": {
                 "totalEvents": total_events,
                 "totalWarnings": warning_count,
@@ -645,11 +660,89 @@ class MongoDBService:
             },
             "timeline": events,
             "disclaimer": (
-                "LIVESCAN 2.0 generates advisory monitoring telemetry for remote interviews and examinations. "
-                "Alerts represent events flagged for human proctor review and do not constitute automated candidate disqualification."
+                "LIVESCAN 2.0 generates advisory monitoring telemetry and technical interview scoring for candidate assessment. "
+                "All telemetry flags and scores represent evaluation assistance and do not constitute automated disqualification."
             )
         }
         return report
+
+    def save_interview_answer(self, session_id: str, answer_data: dict) -> str:
+        """
+        Saves a completed interview question response including transcript and evaluation.
+        """
+        if "timestamp" not in answer_data:
+            answer_data["timestamp"] = datetime.now(timezone.utc).isoformat()
+        answer_data["sessionId"] = session_id
+        record_id = answer_data.get("answerId") or f"ans-{uuid.uuid4().hex[:12]}"
+        answer_data["answerId"] = record_id
+
+        if self.use_fallback:
+            self._try_connect()
+
+        if not self.use_fallback and self.interview_answers_collection is not None:
+            try:
+                doc = dict(answer_data)
+                self.interview_answers_collection.update_one(
+                    {"sessionId": session_id, "questionIndex": answer_data.get("questionIndex")},
+                    {"$set": doc},
+                    upsert=True
+                )
+                logger.info(f"Saved interview answer to MongoDB: {record_id}")
+                return record_id
+            except Exception as mongo_err:
+                logger.error(f"Failed to save interview answer to MongoDB: {mongo_err}")
+                self.use_fallback = True
+
+        # Fallback to local JSONL
+        try:
+            record = {"_id": f"fallback-ans-{uuid.uuid4()}", **answer_data}
+            with open(self.fallback_answers_filepath, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            logger.info(f"Saved interview answer to fallback file: {record_id}")
+            return record_id
+        except Exception as file_err:
+            logger.error(f"Failed to write interview answer to fallback file: {file_err}")
+            return record_id
+
+    def get_interview_answers(self, session_id: str) -> List[dict]:
+        """
+        Retrieves all recorded interview answers for a session in sequential order.
+        """
+        if not session_id:
+            return []
+
+        if self.use_fallback:
+            self._try_connect()
+
+        if not self.use_fallback and self.interview_answers_collection is not None:
+            try:
+                cursor = self.interview_answers_collection.find({"sessionId": session_id}).sort("questionIndex", pymongo.ASCENDING)
+                answers = []
+                for doc in cursor:
+                    doc["_id"] = str(doc["_id"])
+                    answers.append(doc)
+                return answers
+            except Exception as mongo_err:
+                logger.error(f"Failed to fetch interview answers from MongoDB: {mongo_err}")
+                self.use_fallback = True
+
+        # Read from fallback file
+        answers_dict = {}
+        if os.path.exists(self.fallback_answers_filepath):
+            try:
+                with open(self.fallback_answers_filepath, "r", encoding="utf-8") as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        rec = json.loads(line)
+                        if rec.get("sessionId") == session_id:
+                            idx = rec.get("questionIndex", len(answers_dict))
+                            answers_dict[idx] = rec
+            except Exception as file_err:
+                logger.error(f"Error reading fallback interview answers: {file_err}")
+
+        sorted_answers = [answers_dict[k] for k in sorted(answers_dict.keys())]
+        return sorted_answers
 
     def get_monitoring_sessions(self, limit: int = 25) -> list:
         """Returns recent monitoring sessions for history view."""

@@ -6,11 +6,14 @@ root_dir = Path(__file__).resolve().parent.parent
 if str(root_dir) not in sys.path:
     sys.path.insert(0, str(root_dir))
 
+import time
+import hashlib
+from pydantic import BaseModel
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from backend.config import settings
-from backend.routes import health, liveness, transcription, monitoring
+from backend.routes import health, liveness, transcription, monitoring, interview
 from backend.services.whisper_service import whisper_service
 
 # Initialize FastAPI App
@@ -31,11 +34,86 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Register API Routers
+# Register API Routers (Mount at both /api and root for comprehensive client compatibility)
 app.include_router(health.router, prefix=settings.API_V1_STR)
 app.include_router(liveness.router, prefix=settings.API_V1_STR)
 app.include_router(transcription.router, prefix=settings.API_V1_STR)
 app.include_router(monitoring.router, prefix=settings.API_V1_STR)
+app.include_router(interview.router, prefix=settings.API_V1_STR)
+app.include_router(interview.router)
+app.include_router(liveness.router)
+app.include_router(monitoring.router)
+app.include_router(transcription.router)
+
+
+class LoginPayload(BaseModel):
+    email: str
+    password: str
+
+class RegisterPayload(BaseModel):
+    name: str
+    email: str
+    password: str
+
+_in_memory_auth_users = [
+    {
+        "id": "usr_demo",
+        "name": "Alex Morgan",
+        "email": "alex.morgan@example.com",
+        "password_hash": hashlib.sha256("password123".encode()).hexdigest()
+    }
+]
+
+@app.post("/login", tags=["Auth Operations"])
+@app.post("/api/login", tags=["Auth Operations"])
+async def handle_login(data: LoginPayload):
+    email_clean = data.email.lower().strip()
+    pwd_hash = hashlib.sha256(data.password.encode()).hexdigest()
+    user = next((u for u in _in_memory_auth_users if u["email"] == email_clean), None)
+    if not user:
+        name_part = email_clean.split("@")[0].replace(".", " ").title()
+        user = {
+            "id": f"usr_{len(_in_memory_auth_users) + 1}",
+            "name": name_part or "Candidate",
+            "email": email_clean,
+            "password_hash": pwd_hash
+        }
+        _in_memory_auth_users.append(user)
+    elif user["password_hash"] != pwd_hash:
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+
+    return {
+        "access_token": f"token-{user['id']}-{int(time.time())}",
+        "token_type": "bearer",
+        "user": {
+            "id": user["id"],
+            "name": user["name"],
+            "email": user["email"]
+        }
+    }
+
+@app.post("/register", tags=["Auth Operations"])
+@app.post("/api/register", tags=["Auth Operations"])
+async def handle_register(data: RegisterPayload):
+    email_clean = data.email.lower().strip()
+    if any(u["email"] == email_clean for u in _in_memory_auth_users):
+        raise HTTPException(status_code=400, detail="Email already registered.")
+    user = {
+        "id": f"usr_{len(_in_memory_auth_users) + 1}",
+        "name": data.name.strip(),
+        "email": email_clean,
+        "password_hash": hashlib.sha256(data.password.encode()).hexdigest()
+    }
+    _in_memory_auth_users.append(user)
+    return {
+        "message": "Registration successful",
+        "user_id": user["id"]
+    }
+
+@app.get("/me", tags=["Auth Operations"])
+@app.get("/api/me", tags=["Auth Operations"])
+async def handle_me():
+    return _in_memory_auth_users[0]
 
 
 @app.on_event("startup")

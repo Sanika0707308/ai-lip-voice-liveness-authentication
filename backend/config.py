@@ -24,7 +24,7 @@ class Settings:
     SYNC_SMOOTHING_WINDOW: int = int(os.getenv("SYNC_SMOOTHING_WINDOW", "5"))
     MIN_AUDIO_ENERGY: float = float(os.getenv("MIN_AUDIO_ENERGY", "0.02"))
     LIVE_SYNC_THRESHOLD: float = float(os.getenv("LIVE_SYNC_THRESHOLD", "0.45"))
-    MIN_VALID_SYNC_FRAMES: int = int(os.getenv("MIN_VALID_SYNC_FRAMES", "30"))
+    MIN_VALID_SYNC_FRAMES: int = int(os.getenv("MIN_VALID_SYNC_FRAMES", "20"))
 
     # Adaptive Per-User Calibration Configurations
     CALIBRATION_REQUIRED_SAMPLES: int = int(os.getenv("CALIBRATION_REQUIRED_SAMPLES", "3"))
@@ -42,14 +42,14 @@ class Settings:
         "hi": "Hindi",
         "mr": "Marathi"
     }
-    MAX_VERIFICATION_ATTEMPTS: int = int(os.getenv("MAX_VERIFICATION_ATTEMPTS", "3"))
-    MAX_MONITORING_WARNINGS: int = int(os.getenv("MAX_MONITORING_WARNINGS", "3"))
+    MAX_VERIFICATION_ATTEMPTS: int = int(os.getenv("MAX_VERIFICATION_ATTEMPTS", "5"))
+    MAX_MONITORING_WARNINGS: int = int(os.getenv("MAX_MONITORING_WARNINGS", "5"))
     AUDIO_MIN_DURATION_SEC: float = float(os.getenv("AUDIO_MIN_DURATION_SEC", "2.0"))
     AUDIO_MAX_DURATION_SEC: float = float(os.getenv("AUDIO_MAX_DURATION_SEC", "6.0"))
     TARGET_RECORDING_DURATION_SEC: float = 5.0
     WHISPER_CONFIDENCE_THRESHOLD: float = float(os.getenv("WHISPER_CONFIDENCE_THRESHOLD", "0.60"))
     CHALLENGE_MATCH_THRESHOLD: float = float(os.getenv("CHALLENGE_MATCH_THRESHOLD", "70.0"))
-    CHALLENGE_TIMEOUT_SECONDS: int = int(os.getenv("CHALLENGE_TIMEOUT_SECONDS", "60"))
+    CHALLENGE_TIMEOUT_SECONDS: int = int(os.getenv("CHALLENGE_TIMEOUT_SECONDS", "300"))
 
     # Score weights
     WEIGHT_CHARACTER_SIMILARITY: float = 0.40

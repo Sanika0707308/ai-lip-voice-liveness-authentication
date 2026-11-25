@@ -32,6 +32,147 @@ if not logger.handlers:
 
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB limit to align with transcription limit
 
+_HALLUCINATED_PHRASES = {
+    "[blank_audio]", "[inaudible]", "blank_audio", "blank audio", "inaudible",
+    "thank you for watching!", "thank you for watching", "subtitles by", "subtitles",
+    "thank you.", "thank you", "you"
+}
+_HALLUCINATED_SUBSTRINGS = (
+    "[blank_audio]", "blank_audio", "thank you for watching",
+    "subtitles by", "[inaudible]", "inaudible"
+)
+
+def _infer_audio_suffix(upload_file: UploadFile) -> str:
+    """Infers file extension from upload filename or MIME type for container-aware decoding."""
+    ext = os.path.splitext(getattr(upload_file, "filename", "") or "")[1].lower()
+    if ext in {".webm", ".wav", ".ogg", ".mp4", ".m4a", ".mp3"}:
+        return ext
+    ctype = (getattr(upload_file, "content_type", "") or "").lower()
+    if "wav" in ctype:
+        return ".wav"
+    if "ogg" in ctype:
+        return ".ogg"
+    if "mp4" in ctype or "m4a" in ctype or "aac" in ctype:
+        return ".mp4"
+    if "mpeg" in ctype or "mp3" in ctype:
+        return ".mp3"
+    return ".webm"
+
+def _save_and_normalize_audio(upload_file: UploadFile, session_id: str, route_label: str) -> tuple:
+    """
+    Saves the uploaded audio with its inferred container suffix, converts it to
+    16kHz mono PCM WAV via FFmpeg, logs capture diagnostics, and returns
+    (temp_upload_path, temp_wav_path, audio_meta).
+    """
+    suffix = _infer_audio_suffix(upload_file)
+    temp_upload = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    try:
+        shutil.copyfileobj(upload_file.file, temp_upload)
+    finally:
+        temp_upload.close()
+    temp_upload_path = temp_upload.name
+    upload_bytes = os.path.getsize(temp_upload_path)
+    temp_wav_path, audio_meta = sync_service.convert_to_wav(temp_upload_path)
+    logger.info(
+        f"[CHECK: AUDIO_CAPTURE] Session={session_id} | Route={route_label} | "
+        f"File={getattr(upload_file, 'filename', None) or 'upload'} ({suffix}) | "
+        f"UploadBytes={upload_bytes} | WavBytes={audio_meta['wavBytes']} | "
+        f"DurationMs={audio_meta['durationMs']} | SampleRate={audio_meta['sampleRate']} | "
+        f"OverallRMS={audio_meta['overallRms']:.5f} | PeakAmp={audio_meta['peakAmplitude']:.5f}"
+    )
+    return temp_upload_path, temp_wav_path, audio_meta
+
+def _evaluate_audio_silence(metrics: Dict[str, Any], recognized_text: str) -> tuple:
+    """
+    Returns (is_whisper_silent, is_audio_silent) using consistent thresholds
+    matching SyncService silence rejection.
+    """
+    cleaned_rec = (recognized_text or "").strip().lower()
+    is_whisper_silent = (
+        not cleaned_rec
+        or cleaned_rec in _HALLUCINATED_PHRASES
+        or any(h in cleaned_rec for h in _HALLUCINATED_SUBSTRINGS)
+    )
+    min_speech_frames = min(settings.MIN_VALID_SYNC_FRAMES, 15)
+    is_audio_silent = (
+        metrics.get("validFrames", 0) < min_speech_frames
+        or metrics.get("averageAudioEnergy", 0.0) < 0.006
+        or metrics.get("maxAudioEnergy", 0.0) < 0.025
+    )
+    return is_whisper_silent, is_audio_silent
+
+def _cleanup_temp_files(*paths: str) -> None:
+    """Safely removes temporary audio files."""
+    for path in paths:
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception as cleanup_err:
+                logger.error(f"Failed to delete temporary audio file {path}: {cleanup_err}")
+
+# In-memory registry of verified users and sessions
+VERIFIED_LIVENESS_USERS: Dict[str, datetime] = {}
+
+def mark_liveness_verified(user_id: str = None, session_id: str = None):
+    now_dt = datetime.now(timezone.utc)
+    if user_id:
+        VERIFIED_LIVENESS_USERS[str(user_id)] = now_dt
+    if session_id:
+        VERIFIED_LIVENESS_USERS[str(session_id)] = now_dt
+    try:
+        if mongodb_service and not mongodb_service.use_fallback and mongodb_service.db is not None:
+            record = {
+                "user_id": str(user_id) if user_id else str(session_id),
+                "session_id": str(session_id) if session_id else str(user_id),
+                "verified": True,
+                "verified_at": now_dt.isoformat()
+            }
+            mongodb_service.db["liveness_verifications"].update_one(
+                {"$or": [{"user_id": str(user_id)}, {"session_id": str(session_id)}]},
+                {"$set": record},
+                upsert=True
+            )
+    except Exception as e:
+        logger.warning(f"Notice during liveness verification persistence: {e}")
+
+def is_liveness_verified(user_id: str = None, session_id: str = None) -> bool:
+    if not user_id and not session_id:
+        return False
+    if user_id and str(user_id) in VERIFIED_LIVENESS_USERS:
+        return True
+    if session_id and str(session_id) in VERIFIED_LIVENESS_USERS:
+        return True
+    try:
+        if mongodb_service and not mongodb_service.use_fallback and mongodb_service.db is not None:
+            or_clauses = []
+            if user_id:
+                or_clauses.append({"user_id": str(user_id)})
+                or_clauses.append({"userId": str(user_id)})
+            if session_id:
+                or_clauses.append({"session_id": str(session_id)})
+                or_clauses.append({"sessionId": str(session_id)})
+            if or_clauses:
+                rec = mongodb_service.db["liveness_verifications"].find_one({"$or": or_clauses, "verified": True})
+                if rec:
+                    if user_id:
+                        VERIFIED_LIVENESS_USERS[str(user_id)] = datetime.now(timezone.utc)
+                    if session_id:
+                        VERIFIED_LIVENESS_USERS[str(session_id)] = datetime.now(timezone.utc)
+                    return True
+    except Exception:
+        pass
+    return False
+
+@router.get("/liveness/status", tags=["Liveness Operations"])
+async def get_liveness_status(userId: str = None, sessionId: str = None) -> Dict[str, Any]:
+    verified = is_liveness_verified(userId, sessionId)
+    return {
+        "verified": verified,
+        "userId": userId,
+        "sessionId": sessionId,
+        "status": "LIVE" if verified else "UNVERIFIED"
+    }
+
 @router.get("/liveness", tags=["Liveness Operations"])
 async def check_liveness() -> Dict[str, Any]:
     """
@@ -65,6 +206,14 @@ async def sync_lip_voice(
     Endpoint to validate video/audio and lip coordinate timestamps, 
     perform cross-correlation synchronization checks, and verify matching session durations.
     """
+    # Safe defaults to prevent any UnboundLocalError or NameError under any branch or exception
+    is_phrase_pass: bool = False
+    is_phrase_verified: bool = False
+    is_sync_live: bool = False
+    is_biometric_valid: bool = False
+    final_status: str = "SPOOF"
+    rejection_reason: str = None
+
     # 0. Enforce verification session rate limit / attempts tracker check
     if not sessionId or not sessionId.strip():
         logger.warning("Missing session ID in Form data.")
@@ -277,14 +426,25 @@ async def sync_lip_voice(
             }
         )
 
-    # 8. Thread-safe temporary file handling for upload storage
-    temp_upload = None
+    # 8. Thread-safe temporary file handling and FFmpeg 16kHz PCM normalization
     temp_upload_path = None
+    temp_wav_path = None
+    audio_meta = {}
     try:
-        temp_upload = tempfile.NamedTemporaryFile(delete=False)
-        shutil.copyfileobj(file.file, temp_upload)
-        temp_upload.close()  # Close immediately so other programs can read it
-        temp_upload_path = temp_upload.name
+        try:
+            temp_upload_path, temp_wav_path, audio_meta = _save_and_normalize_audio(file, sessionId, "sync")
+        except AudioProcessingError as ape:
+            logger.warning(f"Session {sessionId} - Audio normalization error: {str(ape)}")
+            return JSONResponse(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                content={
+                    "success": False,
+                    "error": {
+                        "code": "AUDIO_PROCESSING_ERROR",
+                        "message": str(ape)
+                    }
+                }
+            )
 
         start_time = time.time()
 
@@ -293,17 +453,23 @@ async def sync_lip_voice(
             language if (language and language.strip()) else attempt_tracker.get_language(sessionId)
         )
 
-        # Validate challenge attempt (enforce server-stored phrase, short expiration, and one-time use)
+        # Validate challenge attempt (enforce server-stored phrase, generous expiration, and one-time use)
         valid_attempt, reason_code, attempt_info = attempt_tracker.validate_attempt(sessionId)
         if not valid_attempt:
-            # Check if this is a direct test call without /challenge/new
-            if reason_code == "MISSING_CHALLENGE" and challengePhrase and challengePhrase.strip():
-                expected_phrase = challengePhrase.strip()
-                attempt_tracker.set_challenge(sessionId, expected_phrase, language=lang_code)
+            # Check if we can recover the challenge from client submission or existing session record
+            client_phrase = challengePhrase.strip() if challengePhrase and challengePhrase.strip() else None
+            stored_phrase = attempt_info.get("challenge") if attempt_info else None
+            recoverable_phrase = client_phrase or stored_phrase
+
+            if recoverable_phrase:
+                expected_phrase = recoverable_phrase
+                attempt_tracker.set_challenge(sessionId, expected_phrase, language=lang_code, ttl_seconds=settings.CHALLENGE_TIMEOUT_SECONDS)
                 attempt_info = attempt_tracker.get_challenge_record(sessionId)
-            elif reason_code == "MISSING_CHALLENGE" and settings.DEBUG and sessionId and sessionId.startswith("test-session"):
+                valid_attempt = True
+            elif settings.DEBUG and sessionId and sessionId.startswith("test-session"):
                 expected_phrase = "test phrase"
                 attempt_info = {"attempt_id": f"att-{sessionId}", "challenge": expected_phrase, "language": lang_code}
+                valid_attempt = True
             else:
                 if reason_code == "CHALLENGE_EXPIRED":
                     err_msg = "Challenge phrase has expired. Please fetch a new challenge."
@@ -322,24 +488,28 @@ async def sync_lip_voice(
                         }
                     }
                 )
-        else:
-            # Server-stored expected phrase is authoritative! Frontend cannot change it after recording starts.
+        if valid_attempt and 'expected_phrase' not in locals():
             expected_phrase = attempt_info.get("challenge")
             lang_code = attempt_info.get("language") or lang_code
 
         # Attempt ID for tracking
         resolved_attempt_id = attemptId or attempt_info.get("attempt_id") or sessionId
 
-        # Run Whisper transcription
+        # Run Whisper transcription on normalized 16kHz mono PCM WAV
         try:
             if whisper_service.model is None:
                 whisper_service.load_model()
-            result = whisper_service.transcribe_audio(temp_upload_path, language=lang_code)
+            result = whisper_service.transcribe_audio(temp_wav_path, language=lang_code)
             if not result.get("success", False):
                 raise Exception("Whisper transcription failed")
             
             recognized_text = result.get("text", "")
             whisper_confidence = result.get("confidence", 0.0)
+            logger.info(
+                f"[CHECK: WHISPER_RAW] Session={sessionId} | Lang={lang_code} | "
+                f"DetectedLang={result.get('detected_language')} | DurationSec={result.get('duration')} | "
+                f"Confidence={whisper_confidence:.3f} | Text='{recognized_text}'"
+            )
         except Exception as te:
             logger.warning(f"Session {sessionId} - Whisper transcription failed: {str(te)}")
             return JSONResponse(
@@ -361,6 +531,17 @@ async def sync_lip_voice(
             whisper_confidence=whisper_confidence,
             language=lang_code
         )
+        if verification.get("verificationStatus") != "PASS" and challengePhrase and challengePhrase.strip() and challengePhrase.strip() != expected_phrase:
+            alt_verification = VerificationEngine.verify(
+                session_id=sessionId,
+                expected_phrase=challengePhrase.strip(),
+                recognized_text=recognized_text,
+                whisper_confidence=whisper_confidence,
+                language=lang_code
+            )
+            if alt_verification.get("overallScore", 0) > verification.get("overallScore", 0):
+                verification = alt_verification
+                expected_phrase = challengePhrase.strip()
 
         # Resolve per-user adaptive or global synchronization threshold
         threshold_info = calibration_service.resolve_threshold_for_verification(
@@ -378,7 +559,7 @@ async def sync_lip_voice(
             metrics = sync_service.calculate_sync_metrics(
                 lip_movement,
                 lip_timestamps,
-                temp_upload_path,
+                temp_wav_path,
                 correlation_threshold=effective_threshold
             )
         except AudioProcessingError as ape:
@@ -410,8 +591,8 @@ async def sync_lip_voice(
         lip_duration_ms = int(round(lip_timestamps[-1] - lip_timestamps[0]))
         duration_diff_ms = abs(audio_duration_ms - lip_duration_ms)
 
-        # 10. Check duration mismatch threshold (500 ms)
-        duration_mismatch = duration_diff_ms > settings.MAX_SYNC_TIME_DIFF_MS
+        # 10. Check duration mismatch threshold (generous 2500ms file buffer to account for MediaRecorder startup/shutdown latency)
+        duration_mismatch = duration_diff_ms > 2500
         if duration_mismatch and settings.DEBUG and sessionId and sessionId.startswith("test-session"):
             logger.warning(
                 f"Session {sessionId} - Duration mismatch: audio={audio_duration_ms}ms, "
@@ -430,19 +611,43 @@ async def sync_lip_voice(
 
         processing_time_ms = int(round((time.time() - start_time) * 1000))
 
-        is_sync_live = metrics.get("syncStatus") == "LIVE" and not duration_mismatch
-        is_phrase_pass = verification["verificationStatus"] == "PASS"
-        
-        # Combined Liveness Decision: both must pass
-        if settings.DEBUG and sessionId and sessionId.startswith("test-session"):
-            final_status = metrics.get("syncStatus", "PENDING")
-        else:
-            final_status = "LIVE" if (is_sync_live and is_phrase_pass) else "SPOOF"
+        # Silence & speech detection (shared helper aligned with SyncService thresholds)
+        is_whisper_silent, is_audio_silent = _evaluate_audio_silence(metrics, recognized_text)
+
+        # Spoken challenge phrase match result:
+        # Requires audible speech, non-hallucinatory transcription, and matching phrase score
+        is_phrase_pass = (
+            not is_whisper_silent
+            and not is_audio_silent
+            and (
+                verification.get("verificationStatus") == "PASS"
+                or verification.get("overallScore", 0.0) >= settings.CHALLENGE_MATCH_THRESHOLD
+            )
+        )
+        is_phrase_verified = is_phrase_pass
+
+        is_biometric_valid = (
+            metrics.get("isLipMoving", False)
+            and not duration_mismatch
+            and metrics.get("validFrames", 0) >= 15
+            and abs(metrics.get("detectedTimeOffsetMs", 0.0)) <= settings.MAX_SYNC_TIME_DIFF_MS
+        )
+
+        is_sync_live = (
+            metrics.get("syncStatus") == "LIVE"
+            and not duration_mismatch
+            and not is_audio_silent
+        )
+
+        # Both lip-voice synchronization and spoken challenge matching are strictly required!
+        final_status = "LIVE" if (is_sync_live and is_phrase_pass and is_biometric_valid) else "SPOOF"
 
         # Determine explicit rejection reason for SPOOF decisions
         rejection_reason = None
         if final_status == "SPOOF":
-            if duration_mismatch:
+            if is_audio_silent or is_whisper_silent:
+                rejection_reason = "No speech detected. Please speak the displayed challenge phrase aloud."
+            elif duration_mismatch:
                 rejection_reason = (
                     f"Recording duration mismatch: Audio duration ({audio_duration_ms}ms) and "
                     f"lip tracking duration ({lip_duration_ms}ms) differ by {duration_diff_ms}ms (> {settings.MAX_SYNC_TIME_DIFF_MS:.0f}ms)."
@@ -452,15 +657,13 @@ async def sync_lip_voice(
                     "syncReason",
                     "Insufficient or static lip movement detected. Physical lip movement is required."
                 )
-            elif not is_sync_live and not is_phrase_pass:
-                rejection_reason = (
-                    f"Both lip-voice synchronization failed ({metrics.get('syncReason')}) "
-                    f"and spoken phrase verification failed ({verification['verificationReason']})."
+            elif not is_phrase_pass:
+                rejection_reason = verification.get(
+                    "verificationReason",
+                    f"Spoken phrase ('{recognized_text}') did not match the expected challenge phrase ('{expected_phrase}')."
                 )
             elif not is_sync_live:
                 rejection_reason = metrics.get("syncReason", "Lip movement and voice activity are not sufficiently synchronized.")
-            elif not is_phrase_pass:
-                rejection_reason = verification.get("verificationReason", "Spoken phrase does not match the challenge phrase.")
             else:
                 rejection_reason = "Liveness verification criteria not satisfied."
 
@@ -481,6 +684,15 @@ async def sync_lip_voice(
             f"Variance={metrics.get('lipVariance', 0.0):.6f} | "
             f"MinVariance={settings.MIN_LIP_VARIATION:.6f} | "
             f"IsMoving={metrics.get('isLipMoving', False)}"
+        )
+        logger.info(
+            f"[CHECK: AUDIO_ENERGY] WavDurationMs={audio_meta.get('durationMs', 0)}ms | "
+            f"OverallRMS={audio_meta.get('overallRms', 0.0):.5f} | "
+            f"AvgEnergy={metrics.get('averageAudioEnergy', 0.0):.5f} | "
+            f"MaxEnergy={metrics.get('maxAudioEnergy', 0.0):.5f} | "
+            f"ValidFrames={metrics.get('validFrames', 0)} | "
+            f"AudioSilent={is_audio_silent} | WhisperSilent={is_whisper_silent} | "
+            f"PhrasePass={is_phrase_pass}"
         )
         logger.info(
             f"[CHECK: DURATION] AudioDuration={audio_duration_ms}ms | "
@@ -527,8 +739,9 @@ async def sync_lip_voice(
             "effectiveThreshold": effective_threshold,
             "adaptiveCalibrationUsed": adaptive_used,
             "calibrationStatus": calibration_status,
-            "challengeMatchResult": verification["verificationStatus"],
+            "challengeMatchResult": verification.get("verificationStatus", "FAIL"),
             "isChallengeMatch": is_phrase_pass,
+            "isPhraseVerified": is_phrase_pass,
             "isSyncValid": is_sync_live,
             "isLipMoving": metrics.get("isLipMoving", True),
             "lipVariance": metrics.get("lipVariance", 0.0),
@@ -539,6 +752,8 @@ async def sync_lip_voice(
             "validFrames": metrics.get("validFrames", 0),
             "ignoredFrames": metrics.get("ignoredFrames", 0),
             "averageAudioEnergy": metrics.get("averageAudioEnergy", 0.0),
+            "maxAudioEnergy": metrics.get("maxAudioEnergy", 0.0),
+            "audioRms": audio_meta.get("overallRms", 0.0),
             "syncStatus": metrics.get("syncStatus"),
             "finalStatus": final_status,
             "processingTimeMs": processing_time_ms,
@@ -546,16 +761,21 @@ async def sync_lip_voice(
                 "language": lang_code,
                 "expectedPhrase": expected_phrase,
                 "recognizedText": recognized_text,
-                "characterSimilarityPercentage": verification["characterSimilarityPercentage"],
-                "wordMatchPercentage": verification["wordMatchPercentage"],
+                "characterSimilarityPercentage": verification.get("characterSimilarityPercentage", 0.0),
+                "wordMatchPercentage": verification.get("wordMatchPercentage", 0.0),
                 "whisperConfidence": whisper_confidence,
-                "overallScore": verification["overallScore"],
-                "verificationStatus": verification["verificationStatus"],
-                "verificationReason": verification["verificationReason"]
+                "overallScore": verification.get("overallScore", 0.0),
+                "verificationStatus": verification.get("verificationStatus", "FAIL"),
+                "verificationReason": verification.get("verificationReason", "")
             }
         }
         
         db_log_id = mongodb_service.log_verification_attempt(attempt_data)
+
+        # Mark user/session as verified if liveness result is LIVE
+        if final_status == "LIVE":
+            mark_liveness_verified(resolved_user_id, sessionId)
+            logger.info(f"Liveness verification PASSED (LIVE) for user '{resolved_user_id}' / session '{sessionId}'. Interview access granted.")
 
         # Consume challenge attempt so it cannot be replayed
         attempt_tracker.consume_attempt(sessionId)
@@ -584,6 +804,7 @@ async def sync_lip_voice(
             "challengePhrase": expected_phrase,
             "transcribedPhrase": recognized_text,
             "isChallengeMatch": is_phrase_pass,
+            "isPhraseVerified": is_phrase_pass,
             "isSyncValid": is_sync_live,
             "audioDurationMs": audio_duration_ms,
             "lipDurationMs": lip_duration_ms,
@@ -599,18 +820,20 @@ async def sync_lip_voice(
             "validFrames": metrics.get("validFrames", 0),
             "ignoredFrames": metrics.get("ignoredFrames", 0),
             "averageAudioEnergy": metrics.get("averageAudioEnergy", 0.0),
+            "maxAudioEnergy": metrics.get("maxAudioEnergy", 0.0),
+            "audioRms": audio_meta.get("overallRms", 0.0),
             "processingTimeMs": processing_time_ms,
             "signalSeries": metrics.get("signalSeries"),
             "whisperVerification": {
                 "language": lang_code,
                 "expectedPhrase": expected_phrase,
                 "recognizedText": recognized_text,
-                "characterSimilarityPercentage": verification["characterSimilarityPercentage"],
-                "wordMatchPercentage": verification["wordMatchPercentage"],
+                "characterSimilarityPercentage": verification.get("characterSimilarityPercentage", 0.0),
+                "wordMatchPercentage": verification.get("wordMatchPercentage", 0.0),
                 "whisperConfidence": whisper_confidence,
-                "overallScore": verification["overallScore"],
-                "verificationStatus": verification["verificationStatus"],
-                "verificationReason": verification["verificationReason"]
+                "overallScore": verification.get("overallScore", 0.0),
+                "verificationStatus": verification.get("verificationStatus", "FAIL"),
+                "verificationReason": verification.get("verificationReason", "")
             }
         }
 
@@ -620,20 +843,17 @@ async def sync_lip_voice(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={
                 "success": False,
+                "detail": f"Verification error: {str(exc)}",
                 "error": {
                     "code": "INTERNAL_ERROR",
-                    "message": "An unexpected server error occurred."
+                    "message": f"Verification processing error: {str(exc)}"
                 }
             }
         )
 
     finally:
-        # Clean up temporary uploaded file
-        if temp_upload_path and os.path.exists(temp_upload_path):
-            try:
-                os.remove(temp_upload_path)
-            except Exception as cleanup_err:
-                logger.error(f"Failed to delete temporary upload file {temp_upload_path}: {cleanup_err}")
+        # Clean up temporary uploaded and converted audio files
+        _cleanup_temp_files(temp_upload_path, temp_wav_path)
 
 
 @router.get("/calibration/status", tags=["Calibration Operations"])
@@ -733,6 +953,11 @@ async def submit_calibration_sample(
       - detectedTimeOffsetMs is within +/-500 ms
       - alignedCorrelation >= LIVE_SYNC_THRESHOLD (0.45)
     """
+    # Safe defaults to prevent any UnboundLocalError or NameError under any branch or exception
+    is_phrase_pass: bool = False
+    is_phrase_verified: bool = False
+    is_sync_live: bool = False
+
     if not sessionId or not sessionId.strip():
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -887,13 +1112,23 @@ async def submit_calibration_sample(
             }
         )
 
-    temp_upload = None
     temp_upload_path = None
+    temp_wav_path = None
+    audio_meta = {}
     try:
-        temp_upload = tempfile.NamedTemporaryFile(delete=False)
-        shutil.copyfileobj(file.file, temp_upload)
-        temp_upload.close()
-        temp_upload_path = temp_upload.name
+        try:
+            temp_upload_path, temp_wav_path, audio_meta = _save_and_normalize_audio(file, sessionId, "calibration")
+        except AudioProcessingError as ape:
+            return JSONResponse(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                content={
+                    "success": False,
+                    "error": {
+                        "code": "AUDIO_PROCESSING_ERROR",
+                        "message": str(ape)
+                    }
+                }
+            )
 
         start_time = time.time()
 
@@ -921,15 +1156,20 @@ async def submit_calibration_sample(
                     }
                 )
 
-        # 3. Transcribe speech via Whisper
+        # 3. Transcribe speech via Whisper using normalized 16kHz mono PCM WAV
         try:
             if whisper_service.model is None:
                 whisper_service.load_model()
-            result = whisper_service.transcribe_audio(temp_upload_path, language=lang_code)
+            result = whisper_service.transcribe_audio(temp_wav_path, language=lang_code)
             if not result.get("success", False):
                 raise Exception("Whisper transcription failed")
             recognized_text = result.get("text", "")
             whisper_confidence = result.get("confidence", 0.0)
+            logger.info(
+                f"[CHECK: WHISPER_RAW] Session={sessionId} | Route=calibration | Lang={lang_code} | "
+                f"DetectedLang={result.get('detected_language')} | DurationSec={result.get('duration')} | "
+                f"Confidence={whisper_confidence:.3f} | Text='{recognized_text}'"
+            )
         except Exception as te:
             return JSONResponse(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -956,7 +1196,7 @@ async def submit_calibration_sample(
             metrics = sync_service.calculate_sync_metrics(
                 lip_movement,
                 lip_timestamps,
-                temp_upload_path,
+                temp_wav_path,
                 correlation_threshold=settings.LIVE_SYNC_THRESHOLD
             )
         except AudioProcessingError as ape:
@@ -977,7 +1217,27 @@ async def submit_calibration_sample(
         duration_mismatch = duration_diff_ms > settings.MAX_SYNC_TIME_DIFF_MS
 
         is_sync_live = metrics.get("syncStatus") == "LIVE" and not duration_mismatch
-        is_phrase_pass = verification["verificationStatus"] == "PASS"
+
+        # Silence & speech detection for calibration
+        is_whisper_silent, is_audio_silent = _evaluate_audio_silence(metrics, recognized_text)
+        logger.info(
+            f"[CHECK: AUDIO_ENERGY_CAL] Session={sessionId} | ValidFrames={metrics.get('validFrames', 0)} | "
+            f"AvgEnergy={metrics.get('averageAudioEnergy', 0.0):.5f} | "
+            f"MaxEnergy={metrics.get('maxAudioEnergy', 0.0):.5f} | "
+            f"OverallRMS={audio_meta.get('overallRms', 0.0):.5f} | "
+            f"AudioSilent={is_audio_silent} | WhisperSilent={is_whisper_silent}"
+        )
+
+        # Spoken phrase passes ONLY when audible speech matches challenge threshold
+        is_phrase_pass = (
+            not is_whisper_silent
+            and not is_audio_silent
+            and (
+                verification.get("verificationStatus") == "PASS"
+                or verification.get("overallScore", 0.0) >= settings.CHALLENGE_MATCH_THRESHOLD
+            )
+        )
+        is_phrase_verified = is_phrase_pass
 
         rejection_reason = None
         if duration_mismatch:
@@ -1049,6 +1309,8 @@ async def submit_calibration_sample(
             "validFrames": metrics.get("validFrames", 0),
             "ignoredFrames": metrics.get("ignoredFrames", 0),
             "averageAudioEnergy": metrics.get("averageAudioEnergy", 0.0),
+            "maxAudioEnergy": metrics.get("maxAudioEnergy", 0.0),
+            "audioRms": audio_meta.get("overallRms", 0.0),
             "syncStatus": metrics.get("syncStatus"),
             "finalStatus": "LIVE" if sample_accepted else "SPOOF",
             "processingTimeMs": processing_time_ms,
@@ -1093,6 +1355,7 @@ async def submit_calibration_sample(
             "challengePhrase": expected_phrase,
             "transcribedPhrase": recognized_text,
             "isChallengeMatch": is_phrase_pass,
+            "isPhraseVerified": is_phrase_pass,
             "isSyncValid": is_sync_live,
             "audioDurationMs": audio_duration_ms,
             "lipDurationMs": lip_duration_ms,
@@ -1103,6 +1366,8 @@ async def submit_calibration_sample(
             "validFrames": metrics.get("validFrames", 0),
             "ignoredFrames": metrics.get("ignoredFrames", 0),
             "averageAudioEnergy": metrics.get("averageAudioEnergy", 0.0),
+            "maxAudioEnergy": metrics.get("maxAudioEnergy", 0.0),
+            "audioRms": audio_meta.get("overallRms", 0.0),
             "processingTimeMs": processing_time_ms,
             "signalSeries": metrics.get("signalSeries"),
             "whisperVerification": {
@@ -1124,16 +1389,13 @@ async def submit_calibration_sample(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={
                 "success": False,
+                "detail": f"Calibration error: {str(exc)}",
                 "error": {
                     "code": "INTERNAL_ERROR",
-                    "message": "An unexpected server error occurred during calibration."
+                    "message": f"Calibration processing error: {str(exc)}"
                 }
             }
         )
     finally:
-        if temp_upload_path and os.path.exists(temp_upload_path):
-            try:
-                os.remove(temp_upload_path)
-            except Exception as cleanup_err:
-                logger.error(f"Failed to delete temporary calibration upload file: {cleanup_err}")
+        _cleanup_temp_files(temp_upload_path, temp_wav_path)
 

@@ -5,18 +5,32 @@ import {
   logMonitoringEvent,
   sendMonitoringPersonFrame,
   sendMonitoringAudioChunk,
-  fetchSessionReport
+  fetchSessionReport,
+  initInterviewSession,
+  submitInterviewAnswer,
+  fetchInterviewResults,
+  transcribeAnswerAudio
 } from '../utils/api';
 import SessionReportModal from './SessionReportModal';
 
-const MAX_INTEGRITY_WARNINGS = 3;
+const MAX_INTEGRITY_WARNINGS = 5;
+const DEFAULT_QUESTION_TIME_LIMIT = 120; // 2 minutes per question
 
 export default function InterviewDashboard({
   candidateData,
   initialStream,
   onInterviewEnd
 }) {
-  const { candidateName, candidateEmail, interviewRole, language = 'en', sessionId } = candidateData;
+  const {
+    candidateName = 'Candidate',
+    candidateEmail = 'candidate@example.com',
+    interviewRole = 'Software Specialist',
+    roleId = 'python',
+    customRole = '',
+    skills = '',
+    language = 'en',
+    sessionId
+  } = candidateData;
 
   // Stream & video refs
   const videoRef = useRef(null);
@@ -27,21 +41,30 @@ export default function InterviewDashboard({
   // Background monitoring interval & recorder refs
   const sessionStartTimeRef = useRef(null);
   const timerIntervalRef = useRef(null);
+  const questionTimerIntervalRef = useRef(null);
   const audioMeterIntervalRef = useRef(null);
   const personCheckIntervalRef = useRef(null);
-  const audioRecorderRef = useRef(null);
-  const audioIntervalRef = useRef(null);
-  const audioSliceTimeoutRef = useRef(null);
+  const monitoringAudioRecorderRef = useRef(null);
+  const monitoringAudioIntervalRef = useRef(null);
+  const monitoringAudioSliceTimeoutRef = useRef(null);
   const isAudioMonitoringActiveRef = useRef(false);
+  const isSendingFrameRef = useRef(false);
+  const isSendingAudioRef = useRef(false);
 
-  // Call states
+  // Answer Voice Recorder refs
+  const answerRecorderRef = useRef(null);
+  const answerAudioChunksRef = useRef([]);
+
+  // Hardware controls
   const [isMicMuted, setIsMicMuted] = useState(false);
   const [isVideoOff, setIsVideoOff] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [audioLevel, setAudioLevel] = useState(0);
+  const audioLevelRef = useRef(0);
 
   // Integrity monitoring states
   const [personCount, setPersonCount] = useState(1);
+  const [faceStatus, setFaceStatus] = useState('NORMAL');
   const [warningCount, setWarningCount] = useState(0);
   const [warningsList, setWarningsList] = useState([]);
   const [isSessionExpired, setIsSessionExpired] = useState(false);
@@ -52,12 +75,31 @@ export default function InterviewDashboard({
   const overlayCanvasRef = useRef(null);
   const facesListRef = useRef([]);
   const frameDimRef = useRef({ width: 640, height: 480 });
-  const audioLevelRef = useRef(0);
+
+  // AI Interview Questions & Progression States
+  const [isLoadingQuestions, setIsLoadingQuestions] = useState(true);
+  const [questions, setQuestions] = useState([]);
+  const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
+  const [currentQuestion, setCurrentQuestion] = useState(null);
+  const [questionSecondsLeft, setQuestionSecondsLeft] = useState(DEFAULT_QUESTION_TIME_LIMIT);
+  const [isAISpeaking, setIsAISpeaking] = useState(false);
+
+  // Candidate Answer Inputs
+  const [isRecordingVoiceAnswer, setIsRecordingVoiceAnswer] = useState(false);
+  const isRecordingVoiceAnswerRef = useRef(false);
+  const [voiceSecondsRecorded, setVoiceSecondsRecorded] = useState(0);
+  const voiceTimerRef = useRef(null);
+  const [recordedAudioBlob, setRecordedAudioBlob] = useState(null);
+  const [typedAnswer, setTypedAnswer] = useState('');
+  const [isSubmittingAnswer, setIsSubmittingAnswer] = useState(false);
+  const [lastEvaluation, setLastEvaluation] = useState(null);
+  const [showFeedbackModal, setShowFeedbackModal] = useState(false);
 
   // Final session audit report modal
   const [reportData, setReportData] = useState(null);
   const [isReportOpen, setIsReportOpen] = useState(false);
   const [isEnding, setIsEnding] = useState(false);
+  const [isInterviewCompleted, setIsInterviewCompleted] = useState(false);
 
   // Format stopwatch seconds MM:SS
   const formatTimer = (totalSec) => {
@@ -71,7 +113,40 @@ export default function InterviewDashboard({
     return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
   };
 
-  // Draw smooth face bounding boxes aligned with mirrored webcam feed
+  // -------------------------------------------------------------------------
+  // Text-To-Speech (TTS): Reads questions aloud
+  // -------------------------------------------------------------------------
+  const speakQuestion = (text, lang = 'en') => {
+    if (!text || !window.speechSynthesis) return;
+    try {
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(text);
+      if (lang === 'hi') utterance.lang = 'hi-IN';
+      else if (lang === 'mr') utterance.lang = 'mr-IN';
+      else utterance.lang = 'en-US';
+      utterance.rate = 0.95;
+      utterance.pitch = 1.0;
+      utterance.onstart = () => setIsAISpeaking(true);
+      utterance.onend = () => setIsAISpeaking(false);
+      utterance.onerror = () => setIsAISpeaking(false);
+      window.speechSynthesis.speak(utterance);
+    } catch (e) {
+      setIsAISpeaking(false);
+    }
+  };
+
+  const stopSpeaking = () => {
+    if (window.speechSynthesis) {
+      window.speechSynthesis.cancel();
+      setIsAISpeaking(false);
+    }
+  };
+
+  // -------------------------------------------------------------------------
+  // Face Detection Bounding Boxes Overlay
+  // Rule: When exactly 1 face is present, show clean camera preview without boxes.
+  // When multiple faces detected, draw clean rectangular boxes around each face!
+  // -------------------------------------------------------------------------
   const drawFaceBoundingBoxes = () => {
     const canvas = overlayCanvasRef.current;
     const video = videoRef.current;
@@ -93,16 +168,17 @@ export default function InterviewDashboard({
     }
 
     const faces = facesListRef.current;
-    if (!faces || faces.length === 0) {
+    // SPEC RULE: When exactly 1 face (or 0) is present, do NOT draw any box!
+    if (!faces || faces.length <= 1) {
       return;
     }
 
+    // MULTIPLE FACES DETECTED: Draw clean rectangular boxes around each face
     const videoNativeW = video.videoWidth || frameDimRef.current.width || 640;
     const videoNativeH = video.videoHeight || frameDimRef.current.height || 480;
     const frameW = frameDimRef.current.width || 640;
     const frameH = frameDimRef.current.height || 480;
 
-    // Calculate object-fit: cover mapping
     const containerAspect = width / height;
     const videoAspect = videoNativeW / videoNativeH;
 
@@ -131,19 +207,17 @@ export default function InterviewDashboard({
       const unmirroredX = fx * scaleX - offsetX;
       const unmirroredY = fy * scaleY - offsetY;
 
-      // Because video has CSS transform: scaleX(-1), mirror X coordinate:
+      // Mirror X coordinate since video has CSS transform: scaleX(-1)
       const mirroredX = width - (unmirroredX + boxW);
       const mirroredY = unmirroredY;
 
       const isPrimary = index === 0;
-      const strokeColor = isPrimary ? '#10B981' : '#EF4444'; // Emerald for Face 1, Crimson for Face 2+
-      const badgeBg = isPrimary ? '#059669' : '#DC2626';
-      const labelText = face.label || `Face ${index + 1}${isPrimary ? ' (Candidate)' : ' (Alert)'}`;
+      const strokeColor = isPrimary ? '#3B82F6' : '#EF4444';
+      const badgeBg = isPrimary ? '#2563EB' : '#DC2626';
+      const labelText = isPrimary ? 'Candidate' : `Alert: Additional Person (Face ${index + 1})`;
 
       ctx.save();
-
-      // Rounded bounding box rectangle
-      const radius = 8;
+      const radius = 6;
       ctx.beginPath();
       if (ctx.roundRect) {
         ctx.roundRect(mirroredX, mirroredY, boxW, boxH, radius);
@@ -152,17 +226,16 @@ export default function InterviewDashboard({
       }
       ctx.lineWidth = 2.5;
       ctx.strokeStyle = strokeColor;
-      ctx.shadowColor = isPrimary ? 'rgba(16, 185, 129, 0.45)' : 'rgba(239, 68, 68, 0.6)';
+      ctx.shadowColor = isPrimary ? 'rgba(59, 130, 246, 0.4)' : 'rgba(239, 68, 68, 0.6)';
       ctx.shadowBlur = 8;
       ctx.stroke();
 
-      // Subtle translucent fill
-      ctx.fillStyle = isPrimary ? 'rgba(16, 185, 129, 0.06)' : 'rgba(239, 68, 68, 0.08)';
+      ctx.fillStyle = isPrimary ? 'rgba(59, 130, 246, 0.06)' : 'rgba(239, 68, 68, 0.10)';
       ctx.fill();
 
-      // Unmirrored crisp label pill tag
+      // Label Pill Tag
       ctx.shadowBlur = 0;
-      ctx.font = 'bold 12px "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, sans-serif';
+      ctx.font = 'bold 12px "Plus Jakarta Sans", -apple-system, sans-serif';
       const textMetrics = ctx.measureText(labelText);
       const padX = 10;
       const tagH = 22;
@@ -172,7 +245,7 @@ export default function InterviewDashboard({
 
       ctx.beginPath();
       if (ctx.roundRect) {
-        ctx.roundRect(tagX, tagY, tagW, tagH, 5);
+        ctx.roundRect(tagX, tagY, tagW, tagH, 4);
       } else {
         ctx.rect(tagX, tagY, tagW, tagH);
       }
@@ -182,12 +255,13 @@ export default function InterviewDashboard({
       ctx.fillStyle = '#FFFFFF';
       ctx.textBaseline = 'middle';
       ctx.fillText(labelText, tagX + padX, tagY + tagH / 2);
-
       ctx.restore();
     });
   };
 
-  // Add confirmed warning
+  // -------------------------------------------------------------------------
+  // Record Unified Integrity Warning
+  // -------------------------------------------------------------------------
   const recordWarning = (warningObj) => {
     const timeStr = formatTimeOnly();
     setWarningCount((prevCount) => {
@@ -204,37 +278,49 @@ export default function InterviewDashboard({
 
       setTimeout(() => {
         setBannerAlert((curr) => (curr?.id === item.id ? null : curr));
-      }, 5000);
+      }, 5500);
 
-      // If 3 warnings reached, expire session!
+      // If MAX_INTEGRITY_WARNINGS (5) reached, terminate interview immediately!
       if (newCount >= MAX_INTEGRITY_WARNINGS) {
-        handleExpireSession("Exceeded maximum integrity warnings (3 of 3).");
+        handleExpireSession(`Exceeded maximum allowed integrity warnings (${MAX_INTEGRITY_WARNINGS} of ${MAX_INTEGRITY_WARNINGS}).`);
       }
       return newCount;
     });
   };
 
-  // Session termination on 3 warnings
+  // -------------------------------------------------------------------------
+  // Session Expiry & Termination Handler
+  // -------------------------------------------------------------------------
   const handleExpireSession = async (reason) => {
     setIsSessionExpired(true);
+    stopSpeaking();
     cleanupMonitoring();
 
     try {
       const res = await stopMonitoringSession(sessionId, reason);
       if (res && res.report) {
         setReportData(res.report);
-        setIsReportOpen(true);
       }
     } catch (err) {
       console.warn('Failed to stop session gracefully on expiry:', err);
     }
   };
 
-  // Cleanup all timers and media tracks
+  // -------------------------------------------------------------------------
+  // Cleanup all timers and media
+  // -------------------------------------------------------------------------
   const cleanupMonitoring = () => {
     if (timerIntervalRef.current) {
       clearInterval(timerIntervalRef.current);
       timerIntervalRef.current = null;
+    }
+    if (questionTimerIntervalRef.current) {
+      clearInterval(questionTimerIntervalRef.current);
+      questionTimerIntervalRef.current = null;
+    }
+    if (voiceTimerRef.current) {
+      clearInterval(voiceTimerRef.current);
+      voiceTimerRef.current = null;
     }
     if (audioMeterIntervalRef.current) {
       clearInterval(audioMeterIntervalRef.current);
@@ -244,20 +330,21 @@ export default function InterviewDashboard({
       clearInterval(personCheckIntervalRef.current);
       personCheckIntervalRef.current = null;
     }
-    if (audioIntervalRef.current) {
-      clearTimeout(audioIntervalRef.current);
-      audioIntervalRef.current = null;
+    if (monitoringAudioIntervalRef.current) {
+      clearTimeout(monitoringAudioIntervalRef.current);
+      monitoringAudioIntervalRef.current = null;
     }
-    if (audioSliceTimeoutRef.current) {
-      clearTimeout(audioSliceTimeoutRef.current);
-      audioSliceTimeoutRef.current = null;
+    if (monitoringAudioSliceTimeoutRef.current) {
+      clearTimeout(monitoringAudioSliceTimeoutRef.current);
+      monitoringAudioSliceTimeoutRef.current = null;
     }
     isAudioMonitoringActiveRef.current = false;
 
-    if (audioRecorderRef.current && audioRecorderRef.current.state === 'recording') {
-      try {
-        audioRecorderRef.current.stop();
-      } catch {}
+    if (monitoringAudioRecorderRef.current && monitoringAudioRecorderRef.current.state === 'recording') {
+      try { monitoringAudioRecorderRef.current.stop(); } catch {}
+    }
+    if (answerRecorderRef.current && answerRecorderRef.current.state === 'recording') {
+      try { answerRecorderRef.current.stop(); } catch {}
     }
 
     facesListRef.current = [];
@@ -268,27 +355,30 @@ export default function InterviewDashboard({
 
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => {
-        try {
-          track.stop();
-        } catch {}
+        try { track.stop(); } catch {}
       });
     }
 
     if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
-      try {
-        audioContextRef.current.close();
-      } catch {}
+      try { audioContextRef.current.close(); } catch {}
     }
   };
 
-  // Initialize camera stream, audio analyzer, and monitoring loops
+  // -------------------------------------------------------------------------
+  // Initialization: Media, Monitoring, & Fetch AI Questions
+  // -------------------------------------------------------------------------
   useEffect(() => {
     let isCancelled = false;
 
     const initInterview = async () => {
-      // 1. Ensure stream is active
+      // 1. Ensure camera stream is active and alive
       let stream = streamRef.current;
-      if (!stream || stream.getVideoTracks().length === 0 || !stream.active) {
+      const isStreamAlive = stream && 
+        stream.active && 
+        stream.getVideoTracks().length > 0 && 
+        stream.getVideoTracks().some(t => t.readyState === 'live');
+
+      if (!isStreamAlive) {
         try {
           stream = await navigator.mediaDevices.getUserMedia({
             video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
@@ -304,9 +394,14 @@ export default function InterviewDashboard({
 
       if (videoRef.current && stream) {
         videoRef.current.srcObject = stream;
+        videoRef.current.play().catch((e) => console.warn('Camera video play warning:', e));
       }
 
-      // Audio volume monitoring for candidate speaking feedback
+      // Initialize monitoring session on the backend
+      startMonitoringSession(sessionId, candidateEmail, roleId, language)
+        .catch((mErr) => console.warn('Background monitoring session init notice:', mErr));
+
+      // Audio volume analyzer for speaking activity
       try {
         const AudioContextClass = window.AudioContext || window.webkitAudioContext;
         if (AudioContextClass && stream && stream.getAudioTracks().length > 0) {
@@ -339,11 +434,111 @@ export default function InterviewDashboard({
         console.warn('Audio meter init error:', audioErr);
       }
 
-      // 2. Start monitoring session on backend
+      // 2. Fetch curated / dynamic interview questions matching candidate's selected count
+      setIsLoadingQuestions(true);
+      const targetQuestionCount = candidateData.questionCount || 5;
       try {
-        await startMonitoringSession(sessionId, candidateName, interviewRole, language);
-      } catch (err) {
-        console.warn('Failed to register monitoring session:', err);
+        const initRes = await initInterviewSession(
+          sessionId,
+          roleId,
+          candidateData.experienceLevel || 'fresher',
+          language,
+          candidateName,
+          candidateEmail,
+          skills,
+          customRole,
+          targetQuestionCount
+        );
+
+        if (initRes && initRes.questions && initRes.questions.length > 0) {
+          const loadedQuestions = initRes.questions.slice(0, targetQuestionCount);
+          setQuestions(loadedQuestions);
+          setCurrentQuestionIndex(0);
+          const firstQ = loadedQuestions[0];
+          setCurrentQuestion(firstQ);
+          setQuestionSecondsLeft(firstQ.timeLimit || DEFAULT_QUESTION_TIME_LIMIT);
+
+          // Automatically read first question aloud via TTS
+          setTimeout(() => {
+            speakQuestion(firstQ.question, language);
+          }, 800);
+        } else {
+          throw new Error('Empty questions list returned from server.');
+        }
+      } catch (qErr) {
+        console.warn('Using client question fallback for interview:', qErr);
+        const fullFallbackPool = [
+          {
+            id: 'fb-01',
+            category: 'Core Technical Competency',
+            question: `Can you explain the core foundational concepts and architectural principles you rely on most when developing in ${interviewRole}?`,
+            timeLimit: 120
+          },
+          {
+            id: 'fb-02',
+            category: 'Project Architecture & Challenges',
+            question: `Describe a challenging technical project you worked on recently in ${interviewRole}. What was your design approach and how did you resolve bottlenecks?`,
+            timeLimit: 120
+          },
+          {
+            id: 'fb-03',
+            category: 'System Reliability & Quality Assurance',
+            question: `What is your methodology for debugging complex errors, testing code reliability, and ensuring quality in production systems?`,
+            timeLimit: 120
+          },
+          {
+            id: 'fb-04',
+            category: 'Performance Optimization & Scaling',
+            question: `How do you identify performance bottlenecks and optimize memory, latency, and resource consumption in ${interviewRole}?`,
+            timeLimit: 120
+          },
+          {
+            id: 'fb-05',
+            category: 'Security & API Design',
+            question: `What secure coding practices, input validation strategies, and API communication standards do you implement in ${interviewRole}?`,
+            timeLimit: 120
+          },
+          {
+            id: 'fb-06',
+            category: 'Concurrency & State Management',
+            question: `How do you handle concurrent operations, asynchronous workflows, and state synchronization in ${interviewRole}?`,
+            timeLimit: 120
+          },
+          {
+            id: 'fb-07',
+            category: 'Testing & Continuous Integration',
+            question: `What is your automated testing strategy (unit, integration, regression) and how do you integrate automated testing in your CI/CD pipeline?`,
+            timeLimit: 120
+          },
+          {
+            id: 'fb-08',
+            category: 'Data Persistence & Caching',
+            question: `How do you design database schemas, index queries, and leverage caching layers to maximize throughput?`,
+            timeLimit: 120
+          },
+          {
+            id: 'fb-09',
+            category: 'Incident Response & Production Monitoring',
+            question: `Walk us through a critical production incident or failure you diagnosed. How did you restore availability and implement preventive safeguards?`,
+            timeLimit: 120
+          },
+          {
+            id: 'fb-10',
+            category: 'Technical Leadership & Collaboration',
+            question: `How do you conduct code reviews, mentor peers, and balance rapid feature delivery with architectural maintainability?`,
+            timeLimit: 120
+          }
+        ];
+        const slicedFallback = fullFallbackPool.slice(0, targetQuestionCount);
+        setQuestions(slicedFallback);
+        setCurrentQuestionIndex(0);
+        setCurrentQuestion(slicedFallback[0]);
+        setQuestionSecondsLeft(120);
+        setTimeout(() => {
+          speakQuestion(slicedFallback[0].question, language);
+        }, 800);
+      } finally {
+        setIsLoadingQuestions(false);
       }
 
       // 3. Start stopwatch timer
@@ -356,10 +551,10 @@ export default function InterviewDashboard({
         }
       }, 1000);
 
-      // 4. Attach resize listener for responsive bounding box alignment
+      // 4. Attach resize listener for bounding box canvas
       window.addEventListener('resize', drawFaceBoundingBoxes);
 
-      // 5. Start background Person Detection sampling
+      // 5. Start background Person/Face Detection sampling
       startPersonDetectionLoop();
 
       // 6. Start background Audio/VAD sampling
@@ -370,18 +565,100 @@ export default function InterviewDashboard({
 
     return () => {
       isCancelled = true;
+      stopSpeaking();
       window.removeEventListener('resize', drawFaceBoundingBoxes);
       cleanupMonitoring();
     };
   }, []);
 
-  // Periodic person & face detection sampling (snappy 800ms rate)
+  // -------------------------------------------------------------------------
+  // Per-Question Countdown Timer
+  // -------------------------------------------------------------------------
+  useEffect(() => {
+    if (isSessionExpired || isEnding || isInterviewCompleted || !currentQuestion) return;
+
+    if (questionTimerIntervalRef.current) clearInterval(questionTimerIntervalRef.current);
+
+    questionTimerIntervalRef.current = setInterval(() => {
+      setQuestionSecondsLeft((prev) => {
+        if (prev <= 1) {
+          clearInterval(questionTimerIntervalRef.current);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+
+    return () => {
+      if (questionTimerIntervalRef.current) clearInterval(questionTimerIntervalRef.current);
+    };
+  }, [currentQuestionIndex, isSessionExpired, isEnding, isInterviewCompleted]);
+
+  // -------------------------------------------------------------------------
+  // Browser Tab-Switch & Window Blur Detection
+  // Unified Warning Count increment with 4s cooldown
+  // -------------------------------------------------------------------------
+  useEffect(() => {
+    let tabSwitchCooldown = false;
+
+    const handleTabSwitch = async (eventDetail) => {
+      if (isSessionExpired || isEnding || isInterviewCompleted || tabSwitchCooldown) return;
+      tabSwitchCooldown = true;
+      setTimeout(() => { tabSwitchCooldown = false; }, 4000);
+
+      try {
+        const res = await logMonitoringEvent(
+          sessionId,
+          'TAB_SWITCH_DETECTED',
+          'WARNING',
+          `Candidate navigated away from the interview window (${eventDetail}).`
+        );
+        recordWarning({
+          type: 'TAB_SWITCH_DETECTED',
+          title: 'Browser Tab Switch Detected',
+          message: 'Navigating away from the interview tab is an integrity violation. Please remain focused on this window.',
+          serverCount: res?.warningCount
+        });
+        if (res?.isSessionExpired) {
+          handleExpireSession(`Terminated: Maximum allowed integrity warnings (${MAX_INTEGRITY_WARNINGS} of ${MAX_INTEGRITY_WARNINGS}) exceeded.`);
+        }
+      } catch (e) {
+        recordWarning({
+          type: 'TAB_SWITCH_DETECTED',
+          title: 'Browser Tab Switch Detected',
+          message: 'Navigating away from the interview tab is an integrity violation. Please remain focused on this window.'
+        });
+      }
+    };
+
+    const onVisibilityChange = () => {
+      if (document.hidden) {
+        handleTabSwitch('Tab Hidden');
+      }
+    };
+
+    const onWindowBlur = () => {
+      handleTabSwitch('Window Lost Focus');
+    };
+
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    window.addEventListener('blur', onWindowBlur);
+
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      window.removeEventListener('blur', onWindowBlur);
+    };
+  }, [sessionId, isSessionExpired, isEnding, isInterviewCompleted]);
+
+  // -------------------------------------------------------------------------
+  // Periodic Person & Face Detection Sampling (800ms)
+  // -------------------------------------------------------------------------
   const startPersonDetectionLoop = () => {
     if (personCheckIntervalRef.current) clearInterval(personCheckIntervalRef.current);
 
     personCheckIntervalRef.current = setInterval(async () => {
-      if (isSessionExpired || isEnding) return;
-      if (!videoRef.current || videoRef.current.readyState < 2) return;
+      if (isSessionExpired || isEnding || isInterviewCompleted) return;
+      if (!videoRef.current || videoRef.current.readyState < 2 || isSendingFrameRef.current) return;
 
       try {
         const video = videoRef.current;
@@ -392,14 +669,16 @@ export default function InterviewDashboard({
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
         canvas.toBlob(async (blob) => {
-          if (!blob || isSessionExpired || isEnding) return;
+          if (!blob || isSessionExpired || isEnding || isInterviewCompleted || isSendingFrameRef.current) return;
+          isSendingFrameRef.current = true;
           try {
             const res = await sendMonitoringPersonFrame(sessionId, blob, null);
             if (res.success) {
               const detectedFaceCount = res.faceCount !== undefined ? res.faceCount : (res.personCount || 1);
               setPersonCount(detectedFaceCount);
+              setFaceStatus(res.faceStatus || 'NORMAL');
 
-              // Update face bounding box coordinates and redraw overlay
+              // Update face bounding boxes and redraw overlay
               facesListRef.current = res.faces || [];
               frameDimRef.current = {
                 width: res.frameWidth || canvas.width,
@@ -409,26 +688,31 @@ export default function InterviewDashboard({
 
               if (res.shouldAlert) {
                 recordWarning({
-                  type: 'ADDITIONAL_PERSON_DETECTED',
-                  title: 'Additional Face / Person Detected',
-                  message: res.alertMessage || `Multiple individuals (${detectedFaceCount}) detected in camera view.`,
+                  type: res.alertType || 'ADDITIONAL_PERSON_DETECTED',
+                  title: res.alertType === 'FACE_ABSENT' ? 'Face Absent / Not Visible' : 'Additional Person Detected',
+                  message: res.alertMessage || `Integrity flag: ${detectedFaceCount} individuals in camera view.`,
                   serverCount: res.warningCount
                 });
               }
 
               if (res.isSessionExpired) {
-                handleExpireSession("Terminated by backend: maximum warnings exceeded.");
+                handleExpireSession(`Terminated by proctoring: maximum warnings (${MAX_INTEGRITY_WARNINGS}) exceeded.`);
               }
             }
           } catch (e) {
-            // Non-fatal background snapshot error
+          } finally {
+            isSendingFrameRef.current = false;
           }
         }, 'image/jpeg', 0.70);
-      } catch (err) {}
-    }, 800);
+      } catch (err) {
+        isSendingFrameRef.current = false;
+      }
+    }, 1000);
   };
 
-  // Periodic continuous audio monitoring (self-contained 2.5s slices with dual-speaker separation)
+  // -------------------------------------------------------------------------
+  // Periodic Background Audio / VAD Sampling
+  // -------------------------------------------------------------------------
   const startAudioMonitoringLoop = () => {
     if (!streamRef.current) return;
     const audioTrack = streamRef.current.getAudioTracks()[0];
@@ -443,11 +727,16 @@ export default function InterviewDashboard({
     const options = mimeType ? { mimeType } : {};
 
     const recordNextAudioSlice = () => {
-      if (!isAudioMonitoringActiveRef.current || isSessionExpired || isEnding) return;
+      if (!isAudioMonitoringActiveRef.current || isSessionExpired || isEnding || isInterviewCompleted || isRecordingVoiceAnswerRef.current) {
+        if (isAudioMonitoringActiveRef.current && !isSessionExpired && !isEnding && !isInterviewCompleted) {
+          monitoringAudioSliceTimeoutRef.current = setTimeout(recordNextAudioSlice, 500);
+        }
+        return;
+      }
 
       try {
         const recorder = new MediaRecorder(audioStream, options);
-        audioRecorderRef.current = recorder;
+        monitoringAudioRecorderRef.current = recorder;
         const chunks = [];
 
         recorder.ondataavailable = (e) => {
@@ -455,54 +744,58 @@ export default function InterviewDashboard({
         };
 
         recorder.onstop = async () => {
-          if (chunks.length > 0 && !isMicMuted && !isSessionExpired && !isEnding) {
+          if (chunks.length > 0 && !isMicMuted && !isSessionExpired && !isEnding && !isInterviewCompleted && !isSendingAudioRef.current) {
             const audioBlob = new Blob(chunks, { type: mimeType || 'audio/webm' });
             if (audioBlob.size > 1500) {
+              isSendingAudioRef.current = true;
               try {
-                // Forward whether candidate is currently answering based on real-time audio level
-                const candidateSpeakingNow = audioLevelRef.current > 18;
-                const res = await sendMonitoringAudioChunk(sessionId, audioBlob, language, candidateSpeakingNow);
+                // If candidate is actively recording an answer or audio volume is elevated, inform backend
+                const candidateSpeakingNow = isRecordingVoiceAnswer || audioLevelRef.current > 18;
+                const res = await sendMonitoringAudioChunk(sessionId, audioBlob, language, false, candidateSpeakingNow);
                 if (res.success) {
                   if (res.is_speech_detected) {
-                    if (res.speaker_classification === 'DUAL_SPEAKERS') {
+                    if (res.classification === 'DUAL_SPEAKERS') {
                       setSpeechStatusText('Dual Simultaneous Voices Detected');
-                    } else if (res.speaker_classification === 'CANDIDATE_ANSWERING') {
+                    } else if (res.classification === 'CANDIDATE_ANSWERING') {
                       setSpeechStatusText('Candidate Speaking (Normal)');
                     } else if (res.transcription_snippet) {
                       setSpeechStatusText(`Possible Background Voice: "${res.transcription_snippet}"`);
                     } else {
-                      setSpeechStatusText('Possible background vocal activity');
+                      setSpeechStatusText('Acoustic Vocal Energy Detected');
                     }
                   } else {
                     setSpeechStatusText('Acoustic Environment Normal');
                   }
 
-                  if (res.shouldAlert) {
+                  if (res.should_alert) {
                     recordWarning({
                       type: 'POSSIBLE_BACKGROUND_SPEECH',
-                      title: 'Possible Background Speech Detected',
+                      title: 'Possible Background Voice Detected',
                       message: res.transcription_snippet
                         ? `Acoustic utterance flagged: "${res.transcription_snippet}"`
-                        : (res.alert_message || 'Possible background speech detected in environment.'),
+                        : (res.alert_message || 'Suspicious additional speech detected in environment.'),
                       serverCount: res.warningCount
                     });
                   }
 
                   if (res.isSessionExpired) {
-                    handleExpireSession("Terminated by backend: maximum warnings exceeded.");
+                    handleExpireSession(`Terminated by proctoring: maximum warnings (${MAX_INTEGRITY_WARNINGS}) exceeded.`);
                   }
                 }
-              } catch (e) {}
+              } catch (e) {
+              } finally {
+                isSendingAudioRef.current = false;
+              }
             }
           }
 
-          if (isAudioMonitoringActiveRef.current && !isSessionExpired && !isEnding) {
-            audioSliceTimeoutRef.current = setTimeout(recordNextAudioSlice, 150);
+          if (isAudioMonitoringActiveRef.current && !isSessionExpired && !isEnding && !isInterviewCompleted) {
+            monitoringAudioSliceTimeoutRef.current = setTimeout(recordNextAudioSlice, 400);
           }
         };
 
         recorder.start();
-        audioIntervalRef.current = setTimeout(() => {
+        monitoringAudioIntervalRef.current = setTimeout(() => {
           if (recorder.state === 'recording') {
             try { recorder.stop(); } catch {}
           }
@@ -513,6 +806,172 @@ export default function InterviewDashboard({
     };
 
     recordNextAudioSlice();
+  };
+
+  // -------------------------------------------------------------------------
+  // Voice Answer Recording Controls
+  // -------------------------------------------------------------------------
+  const handleStartVoiceRecording = () => {
+    if (!streamRef.current || isRecordingVoiceAnswer || isSessionExpired || isEnding) return;
+    const audioTrack = streamRef.current.getAudioTracks()[0];
+    if (!audioTrack) {
+      alert('Microphone is not available for voice recording.');
+      return;
+    }
+
+    stopSpeaking(); // stop any TTS prompt
+    answerAudioChunksRef.current = [];
+    setRecordedAudioBlob(null);
+
+    try {
+      const audioStream = new MediaStream([audioTrack]);
+      const recorder = new MediaRecorder(audioStream);
+      answerRecorderRef.current = recorder;
+
+      recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) {
+          answerAudioChunksRef.current.push(e.data);
+        }
+      };
+
+      recorder.onstop = async () => {
+        const blob = new Blob(answerAudioChunksRef.current, { type: 'audio/webm' });
+        setRecordedAudioBlob(blob);
+        if (blob.size > 1200) {
+          try {
+            const res = await transcribeAnswerAudio(blob, language);
+            if (res && res.success && res.text) {
+              setTypedAnswer((prev) => (prev ? `${prev} ${res.text}` : res.text).trim());
+            }
+          } catch (e) {
+            console.warn('Voice answer transcription notice:', e);
+          }
+        }
+      };
+
+      recorder.start(100);
+      setIsRecordingVoiceAnswer(true);
+      isRecordingVoiceAnswerRef.current = true;
+      setVoiceSecondsRecorded(0);
+
+      if (voiceTimerRef.current) clearInterval(voiceTimerRef.current);
+      voiceTimerRef.current = setInterval(() => {
+        setVoiceSecondsRecorded((s) => s + 1);
+      }, 1000);
+    } catch (e) {
+      console.error('Failed to start answer recorder:', e);
+    }
+  };
+
+  const handleStopVoiceRecording = () => {
+    if (!isRecordingVoiceAnswer) return;
+    if (voiceTimerRef.current) {
+      clearInterval(voiceTimerRef.current);
+      voiceTimerRef.current = null;
+    }
+    setIsRecordingVoiceAnswer(false);
+    isRecordingVoiceAnswerRef.current = false;
+    if (answerRecorderRef.current && answerRecorderRef.current.state === 'recording') {
+      try { answerRecorderRef.current.stop(); } catch {}
+    }
+  };
+
+  // -------------------------------------------------------------------------
+  // Submit Candidate Answer (Voice and/or Typed Text)
+  // -------------------------------------------------------------------------
+  const handleSubmitAnswer = async () => {
+    if (isSubmittingAnswer || isSessionExpired || isEnding) return;
+
+    // Check if voice or text was provided
+    const hasVoice = recordedAudioBlob && recordedAudioBlob.size > 500;
+    const hasText = typedAnswer.trim().length > 0;
+
+    if (!hasVoice && !hasText) {
+      alert('Please provide your answer either by recording voice audio or typing in the text box.');
+      return;
+    }
+
+    setIsSubmittingAnswer(true);
+    stopSpeaking();
+
+    try {
+      const res = await submitInterviewAnswer(
+        sessionId,
+        currentQuestionIndex,
+        currentQuestion?.id || `q-${currentQuestionIndex}`,
+        hasVoice ? recordedAudioBlob : null,
+        typedAnswer.trim(),
+        language
+      );
+
+      if (res && res.success) {
+        setLastEvaluation(res.evaluation);
+        setShowFeedbackModal(true);
+
+        // If interview complete, prepare final completion state
+        if (res.isCompleted) {
+          setIsInterviewCompleted(true);
+        }
+      }
+    } catch (err) {
+      alert(err.message || 'Failed to submit answer. Please try again.');
+    } finally {
+      setIsSubmittingAnswer(false);
+    }
+  };
+
+  // -------------------------------------------------------------------------
+  // Advance to Next Question
+  // -------------------------------------------------------------------------
+  const handleProceedToNext = () => {
+    setShowFeedbackModal(false);
+    setLastEvaluation(null);
+    setRecordedAudioBlob(null);
+    setTypedAnswer('');
+    setVoiceSecondsRecorded(0);
+
+    const nextIndex = currentQuestionIndex + 1;
+    if (nextIndex < questions.length) {
+      setCurrentQuestionIndex(nextIndex);
+      const nextQ = questions[nextIndex];
+      setCurrentQuestion(nextQ);
+      setQuestionSecondsLeft(nextQ.timeLimit || DEFAULT_QUESTION_TIME_LIMIT);
+
+      // Speak next question
+      setTimeout(() => {
+        speakQuestion(nextQ.question, language);
+      }, 500);
+    } else {
+      // All questions completed! Open comprehensive results report
+      handleViewFinalResults();
+    }
+  };
+
+  // -------------------------------------------------------------------------
+  // Fetch Full Interview Results & Open Report Modal
+  // -------------------------------------------------------------------------
+  const handleViewFinalResults = async () => {
+    setIsEnding(true);
+    stopSpeaking();
+    cleanupMonitoring();
+
+    try {
+      const resultsRes = await fetchInterviewResults(sessionId);
+      if (resultsRes && resultsRes.report) {
+        setReportData(resultsRes.report);
+      } else {
+        const fallback = await fetchSessionReport(sessionId);
+        setReportData(fallback?.report || null);
+      }
+      setIsReportOpen(true);
+    } catch (err) {
+      console.warn('Failed to compile results report:', err);
+      const fallback = await fetchSessionReport(sessionId);
+      setReportData(fallback?.report || null);
+      setIsReportOpen(true);
+    } finally {
+      setIsEnding(false);
+    }
   };
 
   // Toggle Microphone Mute
@@ -556,35 +1015,13 @@ export default function InterviewDashboard({
     }
   };
 
-  // Gracefully Complete Interview
-  const handleCompleteInterview = async () => {
-    const confirmEnd = window.confirm('Are you sure you want to complete and submit this interview session?');
-    if (!confirmEnd) return;
-
-    setIsEnding(true);
-    cleanupMonitoring();
-
-    try {
-      const res = await stopMonitoringSession(sessionId, 'Candidate ended interview session normally');
-      if (res && res.report) {
-        setReportData(res.report);
-        setIsReportOpen(true);
-      } else {
-        const fallback = await fetchSessionReport(sessionId);
-        if (fallback && fallback.report) {
-          setReportData(fallback.report);
-          setIsReportOpen(true);
-        }
-      }
-    } catch (err) {
-      alert(`Session report compilation completed. Status: normal.`);
-      setIsEnding(false);
-    }
-  };
+  const progressPercent = questions.length > 0
+    ? Math.round(((currentQuestionIndex + (isInterviewCompleted ? 1 : 0)) / questions.length) * 100)
+    : 0;
 
   return (
     <div className="interview-dashboard-wrap">
-      {/* Top Navigation & Status Bar */}
+      {/* Top Header & Telemetry Bar */}
       <header className="dashboard-header-bar">
         <div className="header-brand-info">
           <div className="brand-pill">
@@ -593,18 +1030,23 @@ export default function InterviewDashboard({
           </div>
           <span className="header-divider">/</span>
           <span className="candidate-name-header">{candidateName}</span>
+          {skills && (
+            <span className="header-skills-chip" title={`Focus Skills: ${skills}`}>
+              🎯 {skills.split(',')[0]}
+            </span>
+          )}
         </div>
 
         <div className="header-telemetry-controls">
-          <div className="timer-badge-chip">
+          <div className="timer-badge-chip" title="Total Session Elapsed Time">
             <span className="timer-icon">⏱️</span>
             <span className="timer-value">{formatTimer(elapsedSeconds)}</span>
           </div>
 
           <div className="session-status-chip">
-            <span className={`status-indicator-dot ${isSessionExpired ? 'dot-terminated' : 'dot-live'}`}></span>
+            <span className={`status-indicator-dot ${isSessionExpired ? 'dot-terminated' : isInterviewCompleted ? 'dot-completed' : 'dot-live'}`}></span>
             <span className="status-indicator-text">
-              {isSessionExpired ? 'Session Expired' : 'Interview In Progress'}
+              {isSessionExpired ? 'Session Expired' : isInterviewCompleted ? 'Interview Completed' : 'Interview In Progress'}
             </span>
           </div>
         </div>
@@ -623,20 +1065,258 @@ export default function InterviewDashboard({
         </div>
       )}
 
-      {/* Main Dashboard Grid */}
+      {/* Main Grid: 2-Column Responsive Layout */}
       <div className="dashboard-main-grid">
-        {/* Large Video Area */}
-        <div className="video-conference-stage">
+        {/* Left Column: Interactive AI Interview Stage */}
+        <section className="interview-question-stage">
+          {/* Progress Tracker Bar */}
+          <div className="question-progress-card">
+            <div className="progress-meta-row">
+              <span className="progress-step-text">
+                Question {currentQuestionIndex + 1} of {questions.length || 5}
+              </span>
+              <span className="progress-percent-text">{progressPercent}% Completed</span>
+            </div>
+            <div className="progress-track-bg">
+              <div
+                className="progress-track-fill"
+                style={{ width: `${Math.min(100, Math.max(5, progressPercent))}%` }}
+              ></div>
+            </div>
+          </div>
+
+          {isLoadingQuestions ? (
+            <div className="loading-questions-card">
+              <div className="card-spinner"></div>
+              <h3>Formulating Role Questions with AI...</h3>
+              <p>Analyzing technical track for {interviewRole} ({candidateData.experienceLevel || 'fresher'}).</p>
+            </div>
+          ) : currentQuestion ? (
+            <div className="active-question-card">
+              {/* Question Header */}
+              <div className="question-card-header">
+                <div className="q-category-pill">
+                  <span className="category-icon">💡</span>
+                  <span>{currentQuestion.category || 'Technical Evaluation'}</span>
+                </div>
+
+                <div className="q-header-actions">
+                  {/* Countdown Timer */}
+                  <div className={`countdown-chip ${questionSecondsLeft <= 20 ? 'chip-urgent' : ''}`}>
+                    <span className="clock-icon">⏳</span>
+                    <span>{formatTimer(questionSecondsLeft)}</span>
+                  </div>
+
+                  {/* Text-To-Speech Controls */}
+                  {isAISpeaking ? (
+                    <button
+                      type="button"
+                      className="btn-tts-action btn-tts-speaking"
+                      onClick={stopSpeaking}
+                      title="Pause speaking"
+                    >
+                      <span className="tts-pulse-waves">🔊</span>
+                      <span>Stop Speech</span>
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      className="btn-tts-action"
+                      onClick={() => speakQuestion(currentQuestion.question, language)}
+                      title="Read question aloud using AI speech"
+                    >
+                      <span>🔊 Listen Aloud</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* The Actual Question Text */}
+              <div className="question-prompt-box">
+                <h2 className="question-text">{currentQuestion.question}</h2>
+              </div>
+
+              {/* Dual Answering Controls: Voice and Typed Text */}
+              <div className="answering-controls-wrap">
+                {/* Voice Input Section */}
+                <div className="voice-input-card">
+                  <div className="voice-card-header">
+                    <span className="voice-title">🎙️ Spoken Voice Answer</span>
+                    {isRecordingVoiceAnswer && (
+                      <span className="recording-live-tag">
+                        <span className="rec-dot-pulse"></span>
+                        Recording: {formatTimer(voiceSecondsRecorded)}
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="voice-buttons-row">
+                    {!isRecordingVoiceAnswer ? (
+                      <button
+                        type="button"
+                        className="btn-voice-record"
+                        onClick={handleStartVoiceRecording}
+                        disabled={isSubmittingAnswer || isSessionExpired}
+                      >
+                        <span className="btn-icon">🎙️</span>
+                        <span>{recordedAudioBlob ? 'Re-record Voice Answer' : 'Start Voice Recording'}</span>
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        className="btn-voice-stop"
+                        onClick={handleStopVoiceRecording}
+                      >
+                        <span className="btn-icon">⏹</span>
+                        <span>Stop Voice Recording</span>
+                      </button>
+                    )}
+
+                    {recordedAudioBlob && !isRecordingVoiceAnswer && (
+                      <span className="voice-ready-badge">
+                        ✓ Audio captured ({formatTimer(voiceSecondsRecorded)})
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                {/* Typed Text Input Section */}
+                <div className="typed-input-card">
+                  <div className="typed-header">
+                    <label htmlFor="typedAnswerBox" className="typed-label">
+                      ✍️ Or Type Your Answer (or refine transcribed voice):
+                    </label>
+                    <span className="word-count-badge">
+                      {typedAnswer.trim() ? `${typedAnswer.trim().split(/\s+/).length} words` : '0 words'}
+                    </span>
+                  </div>
+
+                  <textarea
+                    id="typedAnswerBox"
+                    className="typed-textarea"
+                    rows={4}
+                    placeholder="Type your structured explanation, code logic, or architectural reasoning here..."
+                    value={typedAnswer}
+                    onChange={(e) => setTypedAnswer(e.target.value)}
+                    disabled={isSubmittingAnswer || isSessionExpired}
+                  />
+                </div>
+
+                {/* Submit Answer Action */}
+                <div className="answer-submit-row">
+                  <button
+                    type="button"
+                    className="btn-submit-answer"
+                    onClick={handleSubmitAnswer}
+                    disabled={
+                      isSubmittingAnswer ||
+                      isSessionExpired ||
+                      (!recordedAudioBlob && !typedAnswer.trim())
+                    }
+                  >
+                    {isSubmittingAnswer ? (
+                      <span className="btn-spinner-content">
+                        <span className="spinner-dot"></span>
+                        <span>Evaluating Technical Accuracy...</span>
+                      </span>
+                    ) : (
+                      <span>Submit Answer & View Evaluation &rarr;</span>
+                    )}
+                  </button>
+                </div>
+              </div>
+
+              {/* Immediate Evaluation Feedback Card */}
+              {showFeedbackModal && lastEvaluation && (
+                <div className="answer-feedback-overlay-card">
+                  <div className="feedback-card-header">
+                    <div className="feedback-score-pill">
+                      <span className="score-num">{lastEvaluation.score}</span>
+                      <span className="score-max">/ 10</span>
+                      <span className="score-pct">({lastEvaluation.percentage}%)</span>
+                    </div>
+                    <span className="feedback-title">Instant Rubric Assessment</span>
+                  </div>
+
+                  {lastEvaluation.strengths && lastEvaluation.strengths.length > 0 && (
+                    <div className="feedback-section strengths-box">
+                      <span className="box-title">✅ Demonstrated Strengths:</span>
+                      <ul>
+                        {lastEvaluation.strengths.map((str, idx) => (
+                          <li key={idx}>{str}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
+                  {lastEvaluation.missingConcepts && lastEvaluation.missingConcepts.length > 0 && (
+                    <div className="feedback-section concepts-box">
+                      <span className="box-title">💡 Concepts to Include:</span>
+                      <div className="concept-tags-wrap">
+                        {lastEvaluation.missingConcepts.map((c, idx) => (
+                          <span key={idx} className="concept-tag">{c}</span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {lastEvaluation.improvementSuggestions && lastEvaluation.improvementSuggestions.length > 0 && (
+                    <div className="feedback-section improvements-box">
+                      <span className="box-title">📈 Improvement Recommendations:</span>
+                      <ul>
+                        {lastEvaluation.improvementSuggestions.map((sug, idx) => (
+                          <li key={idx}>{sug}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
+                  <div className="feedback-next-action-row">
+                    <button
+                      type="button"
+                      className="btn-next-question"
+                      onClick={handleProceedToNext}
+                    >
+                      {currentQuestionIndex + 1 < questions.length ? (
+                        <span>Proceed to Next Question &rarr;</span>
+                      ) : (
+                        <span>Finish Interview & Generate Structured Report &rarr;</span>
+                      )}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="all-completed-card">
+              <span className="completed-icon">🎉</span>
+              <h2>All Questions Answered!</h2>
+              <p>You have successfully answered all technical interview questions.</p>
+              <button
+                type="button"
+                className="btn-primary-large"
+                onClick={handleViewFinalResults}
+              >
+                Generate Final Structured Interview Report &rarr;
+              </button>
+            </div>
+          )}
+        </section>
+
+        {/* Right Column: Live Camera, Face Detection & Proctoring Telemetry */}
+        <aside className="dashboard-monitoring-sidebar">
+          {/* Camera Viewport Card */}
           <div className="video-viewport-card">
             <video
               ref={videoRef}
               autoPlay
               playsInline
               muted
+              onLoadedMetadata={(e) => e.target.play().catch(() => {})}
               className={`dashboard-video-element ${isVideoOff ? 'video-hidden' : ''}`}
             />
 
-            {/* Face Detection Bounding Boxes Canvas Layer */}
+            {/* Overlaid Canvas: Rectangular bounding box ONLY when multiple faces detected */}
             <canvas
               ref={overlayCanvasRef}
               className="face-boxes-overlay-canvas"
@@ -652,21 +1332,36 @@ export default function InterviewDashboard({
               </div>
             )}
 
-            {/* In-Video Overlays */}
+            {/* In-Video Status Overlays */}
             <div className="video-overlay-top-left">
               <span className="candidate-video-badge">{candidateName}</span>
               {audioLevel > 15 && !isMicMuted && (
-                <span className="audio-active-badge">Speaking</span>
+                <span className="audio-active-badge">🎙️ Speaking</span>
               )}
             </div>
 
             <div className="video-overlay-top-right">
-              <span className={`person-count-badge ${personCount > 1 ? 'badge-alert' : 'badge-ok'}`}>
-                {personCount <= 1 ? (personCount === 1 ? '1 Face Detected' : 'No Face Detected') : `${personCount} Faces Detected (Warning)`}
-              </span>
+              {personCount === 1 ? (
+                <span className="person-count-badge badge-ok">1 Face (Verified)</span>
+              ) : personCount > 1 ? (
+                <span className="person-count-badge badge-alert">
+                  ⚠️ {personCount} Faces Detected (Alert)
+                </span>
+              ) : (
+                <span className="person-count-badge badge-warning">
+                  ⚠️ Face Not Visible
+                </span>
+              )}
             </div>
 
-            {/* In-Call Controls Toolbar */}
+            {/* Face Absence Alert Banner if 0 faces */}
+            {personCount === 0 && !isVideoOff && (
+              <div className="face-absence-warning-overlay">
+                <span>⚠️ Face not visible. Please look directly into the camera.</span>
+              </div>
+            )}
+
+            {/* Camera / Mic Toolbar */}
             <div className="video-controls-toolbar">
               <button
                 type="button"
@@ -691,52 +1386,26 @@ export default function InterviewDashboard({
               <button
                 type="button"
                 className="control-btn btn-control-end"
-                onClick={handleCompleteInterview}
+                onClick={handleViewFinalResults}
                 disabled={isEnding || isSessionExpired}
                 title="Finish and submit interview session"
               >
                 <span className="control-icon">⏹</span>
-                <span className="control-label">{isEnding ? 'Ending...' : 'Complete Interview'}</span>
+                <span className="control-label">{isEnding ? 'Compiling...' : 'Finish Interview'}</span>
               </button>
-            </div>
-          </div>
-        </div>
-
-        {/* Right Sidebar: Details and Small Alerts Panel */}
-        <aside className="dashboard-sidebar-panel">
-          {/* Interview Details Card */}
-          <div className="sidebar-card details-card">
-            <h3 className="sidebar-card-title">Interview Details</h3>
-            <div className="details-list">
-              <div className="detail-item">
-                <span className="detail-key">Candidate:</span>
-                <span className="detail-val">{candidateName}</span>
-              </div>
-              <div className="detail-item">
-                <span className="detail-key">Email:</span>
-                <span className="detail-val text-truncate">{candidateEmail}</span>
-              </div>
-              <div className="detail-item">
-                <span className="detail-key">Position:</span>
-                <span className="detail-val">{interviewRole}</span>
-              </div>
-              <div className="detail-item">
-                <span className="detail-key">Session Key:</span>
-                <code className="detail-val font-mono">{sessionId.slice(0, 14)}...</code>
-              </div>
             </div>
           </div>
 
           {/* Monitoring Integrity Summary */}
           <div className="sidebar-card status-metrics-card">
-            <h3 className="sidebar-card-title">Integrity Status</h3>
+            <h3 className="sidebar-card-title">Real-Time Telemetry</h3>
             <div className="integrity-status-rows">
               <div className="status-row">
                 <span className="status-row-icon">👤</span>
                 <div className="status-row-content">
-                  <span className="status-row-label">Visual Verification</span>
-                  <span className={`status-row-value ${personCount > 1 ? 'text-warn' : 'text-ok'}`}>
-                    {personCount === 1 ? 'Primary candidate visible' : `Multiple faces detected (${personCount})`}
+                  <span className="status-row-label">Visual Surveillance</span>
+                  <span className={`status-row-value ${personCount > 1 ? 'text-warn' : personCount === 0 ? 'text-danger' : 'text-ok'}`}>
+                    {personCount === 1 ? 'Single candidate verified' : personCount > 1 ? `Multiple faces detected (${personCount})` : 'Face not visible'}
                   </span>
                 </div>
               </div>
@@ -748,13 +1417,21 @@ export default function InterviewDashboard({
                   <span className="status-row-value">{speechStatusText}</span>
                 </div>
               </div>
+
+              <div className="status-row">
+                <span className="status-row-icon">🖥️</span>
+                <div className="status-row-content">
+                  <span className="status-row-label">Browser Window</span>
+                  <span className="status-row-value text-ok">Active & In Focus</span>
+                </div>
+              </div>
             </div>
           </div>
 
-          {/* Timestamped Warnings Alerts Panel */}
+          {/* Unified Warnings History Panel */}
           <div className="sidebar-card alerts-panel-card">
             <div className="alerts-card-header">
-              <h3 className="sidebar-card-title">Session Warnings</h3>
+              <h3 className="sidebar-card-title">Integrity Warnings</h3>
               <span className={`warning-counter-tag ${warningCount >= MAX_INTEGRITY_WARNINGS ? 'tag-danger' : warningCount > 0 ? 'tag-warning' : 'tag-neutral'}`}>
                 {warningCount} / {MAX_INTEGRITY_WARNINGS} Warnings
               </span>
@@ -763,9 +1440,9 @@ export default function InterviewDashboard({
             {isSessionExpired && (
               <div className="session-terminated-card" role="alert">
                 <span className="terminated-icon">🚫</span>
-                <h4 className="terminated-title">Session Expired</h4>
+                <h4 className="terminated-title">Interview Terminated</h4>
                 <p className="terminated-sub">
-                  The interview session was terminated because the maximum allowed integrity warnings ({MAX_INTEGRITY_WARNINGS}) was reached.
+                  The interview was terminated because the maximum allowed integrity warnings ({MAX_INTEGRITY_WARNINGS}) was exceeded.
                 </p>
                 <button
                   type="button"
@@ -781,8 +1458,8 @@ export default function InterviewDashboard({
               {warningsList.length === 0 ? (
                 <div className="no-warnings-placeholder">
                   <span className="check-green">✓</span>
-                  <p>No warnings recorded.</p>
-                  <span className="sub-hint">Session integrity is optimal.</span>
+                  <p>No integrity warnings.</p>
+                  <span className="sub-hint">Session compliance is optimal.</span>
                 </div>
               ) : (
                 warningsList.map((warn) => (
@@ -800,7 +1477,7 @@ export default function InterviewDashboard({
         </aside>
       </div>
 
-      {/* Audit Report Modal */}
+      {/* Comprehensive Final Session Report Modal */}
       {isReportOpen && reportData && (
         <SessionReportModal
           report={reportData}

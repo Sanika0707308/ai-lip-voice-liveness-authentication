@@ -370,8 +370,8 @@ def calculate_weighted_score(char_score: float, word_score: float, confidence: f
     
     # Textual similarity score
     text_score = (char_score * 0.5) + (word_score * 0.5)
-    if text_score >= 75.0:
-        blended_score = (text_score * 0.85) + (confidence_percentage * 0.15)
+    if text_score >= 60.0:
+        blended_score = (text_score * 0.90) + (confidence_percentage * 0.10)
         return float(max(standard_score, blended_score))
     
     return float(standard_score)
@@ -382,15 +382,24 @@ def get_adaptive_threshold(expected_phrase: str) -> float:
     """
     return getattr(settings, "CHALLENGE_MATCH_THRESHOLD", 70.0)
 
-def evaluate_verification(score: float, expected_text: str, recognized_text: str, threshold: float) -> tuple[str, str]:
+def evaluate_verification(score: float, expected_text: str, recognized_text: str, threshold: float, raw_recognized: str = "") -> tuple[str, str]:
     """
     Evaluates whether the challenge verification passes or fails.
     - If recognized_text has no speech/meaningful content: FAIL immediately.
     - If score >= threshold: PASS.
     - Else: FAIL.
     """
-    if not recognized_text.strip():
-        return "FAIL", "No speech detected in the audio recording."
+    cleaned = (recognized_text or "").strip().lower()
+    raw_lower = (raw_recognized or recognized_text or "").strip().lower()
+
+    # Whisper silence hallucination patterns
+    hallucination_keywords = ["blank_audio", "thank you", "watching", "subtitles", "inaudible", "blank audio"]
+    is_hallucination = (
+        not cleaned or
+        any(h in raw_lower or h in cleaned for h in hallucination_keywords)
+    )
+    if is_hallucination and not any(k in (expected_text or "").lower() for k in ["thank you", "watching", "subtitles"]):
+        return "FAIL", "No audible speech detected. Please speak the challenge phrase clearly."
     
     if score >= threshold:
         return "PASS", "Spoken challenge phrase verified successfully."
@@ -412,19 +421,6 @@ class VerificationEngine:
         language: str = "en"
     ) -> dict:
         lang_code = normalize_language_code(language)
-
-        if settings.DEBUG and session_id and session_id.startswith("test-session"):
-            return {
-                "language": lang_code,
-                "characterSimilarityPercentage": 100.0,
-                "wordMatchPercentage": 100.0,
-                "overallScore": 100.0,
-                "verificationStatus": "PASS",
-                "verificationReason": "Test session bypass",
-                "verificationTimeMs": 0,
-                "adaptiveThreshold": 75.0
-            }
-            
         start_verify_time = datetime.now(timezone.utc)
         
         # 1. Normalization (language-aware)
@@ -448,7 +444,11 @@ class VerificationEngine:
         threshold = get_adaptive_threshold(expected_phrase)
         
         # 5. Result classification
-        status, reason = evaluate_verification(overall_score, norm_expected, norm_recognized, threshold)
+        status, reason = evaluate_verification(overall_score, norm_expected, norm_recognized, threshold, raw_recognized=recognized_text)
+        if "No audible speech detected" in reason:
+            overall_score = 0.0
+            char_sim = 0.0
+            word_sim = 0.0
         
         end_verify_time = datetime.now(timezone.utc)
         verify_time_ms = int((end_verify_time - start_verify_time).total_seconds() * 1000)

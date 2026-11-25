@@ -54,7 +54,10 @@ class PersonDetectionService:
                 "is_warning_active": False,
                 "last_alert_timestamp": 0.0,
                 "last_detected_count": 1,
-                "first_clear_timestamp": None
+                "first_clear_timestamp": None,
+                "face_absent_start_timestamp": None,
+                "face_absent_warning_recorded": False,
+                "interview_paused": False
             }
         return self._session_states[session_id]
 
@@ -362,9 +365,42 @@ class PersonDetectionService:
         should_clear = False
         alert_type = None
         message = None
+        face_status = "NORMAL"
+        grace_seconds_remaining = 0.0
 
-        if raw_person_count > 1:
-            # Person count increased
+        if raw_person_count == 0:
+            # Face is absent
+            if state["face_absent_start_timestamp"] is None:
+                state["face_absent_start_timestamp"] = now
+
+            absent_duration = now - state["face_absent_start_timestamp"]
+            grace_period = 5.0  # 5-second grace period per specification
+
+            if absent_duration < grace_period:
+                face_status = "FACE_ABSENT_GRACE"
+                grace_seconds_remaining = round(max(0.0, grace_period - absent_duration), 1)
+                message = f"Your face is not visible. Please adjust your camera ({grace_seconds_remaining}s grace period)."
+            else:
+                # Grace period expired - record ONE confirmed warning for this continuous absence incident
+                face_status = "FACE_ABSENT_CONFIRMED"
+                state["interview_paused"] = True
+                if not state["face_absent_warning_recorded"]:
+                    should_alert = True
+                    alert_type = "FACE_ABSENT"
+                    message = "Your face is not visible. 1 warning recorded. Interview paused until face is restored."
+                    state["face_absent_warning_recorded"] = True
+                    state["last_alert_timestamp"] = now
+                else:
+                    message = "Your face is not visible. Interview paused. Please restore camera view."
+
+        elif raw_person_count > 1:
+            # Multiple faces detected
+            face_status = "MULTIPLE_FACES"
+            # Reset absence tracking if someone enters
+            state["face_absent_start_timestamp"] = None
+            state["face_absent_warning_recorded"] = False
+            state["interview_paused"] = False
+
             state["consecutive_multi_count"] += 1
             state["consecutive_single_count"] = 0
             state["first_clear_timestamp"] = None
@@ -378,11 +414,15 @@ class PersonDetectionService:
                     state["is_warning_active"] = True
                     state["last_alert_timestamp"] = now
                     alert_type = "ADDITIONAL_PERSON_DETECTED"
-                    message = f"Warning: {raw_person_count} people detected in camera frame."
+                    message = f"Multiple faces detected ({raw_person_count}). Please ensure you are alone."
         else:
-            # Person count is 0 or 1
+            # Exactly 1 person visible (Normal candidate state)
+            face_status = "NORMAL"
             state["consecutive_single_count"] += 1
             state["consecutive_multi_count"] = 0
+            state["face_absent_start_timestamp"] = None
+            state["face_absent_warning_recorded"] = False
+            state["interview_paused"] = False
 
             # If a warning was previously active, require confirmation period before clearing
             if state["is_warning_active"]:
@@ -394,7 +434,7 @@ class PersonDetectionService:
                     state["is_warning_active"] = False
                     state["first_clear_timestamp"] = None
                     alert_type = "PERSON_CLEARED"
-                    message = "Additional person no longer detected. Frame status normal."
+                    message = "Frame status normal: single candidate verified."
 
         state["last_detected_count"] = raw_person_count
 
@@ -404,7 +444,10 @@ class PersonDetectionService:
             "is_warning_active": state["is_warning_active"],
             "alert_type": alert_type,
             "message": message,
-            "confirmed_person_count": raw_person_count
+            "confirmed_person_count": raw_person_count,
+            "face_status": face_status,
+            "interview_paused": state["interview_paused"],
+            "grace_seconds_remaining": grace_seconds_remaining
         }
 
 person_detection_service = PersonDetectionService()
